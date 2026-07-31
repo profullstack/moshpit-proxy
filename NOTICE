@@ -1,0 +1,9 @@
+moshpit-proxy
+Copyright 2026 Profullstack
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+"Moshpit" and "Moshcode" are marks of Profullstack. The Apache License grants
+rights to the code; it does not grant permission to use these names to endorse
+or describe derived works. Reimplementing the pin protocol described in
+README.md is expressly encouraged — call your implementation whatever you like.

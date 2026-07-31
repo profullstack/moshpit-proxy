@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
   "description": "Registry-pinned TLS proxy for Moshpit names. Verifies the origin's key against the registry instead of a certificate authority.",
   "bin": {
     "moshpit-proxy": "bin/moshpit-proxy.ts",
