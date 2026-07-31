@@ -185,3 +185,14 @@ npm test        # node --test tests/*.test.ts
 27 tests. The ones that matter are in `tests/proxy.test.ts`: they stand up a
 real origin over real TLS and check that a vouched-for key gets through and a
 substituted one is refused before any request byte leaves the machine.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache rather than MIT for a specific reason: this is protocol code meant to be
+reimplemented — TronBrowser performs the same pin verification independently —
+and Apache-2.0 carries an explicit patent grant where MIT is silent. Implement
+the pin scheme however you like; the NOTICE covers naming.
+
+Security policy and the trust model behind the local CA: [SECURITY.md](SECURITY.md).
