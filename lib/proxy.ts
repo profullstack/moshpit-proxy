@@ -14,6 +14,14 @@
 // end-to-end; the gateway learns which name was asked for and how many bytes
 // moved, which is what a router learns.
 //
+// The right-hand session is also where post-quantum confidentiality either
+// happens or quietly does not. Node 24 on OpenSSL 3.5 offers X25519MLKEM768
+// first with no configuration, so it usually happens; an origin on an older
+// OpenSSL has no ML-KEM and the handshake falls back to x25519 without
+// complaint. Every upstream leg is classified and counted, and `requirePq`
+// turns the fallback into a refusal. See `pq.ts` for how the group is read and
+// why the reading is proven at startup rather than trusted.
+//
 // Known limitation, stated where someone will find it: ALPN is forced to
 // http/1.1 in both directions. Raw bytes are piped between two independent TLS
 // sessions, so the application protocol has to match on both, and the upstream
@@ -27,6 +35,7 @@ import type { Server, TLSSocket } from "node:tls";
 import type { LocalCa } from "./ca.ts";
 import type { PinClient } from "./pins.ts";
 import { pinFromPeer, pinMatches } from "./spki.ts";
+import { describeKeyExchange } from "./pq.ts";
 
 export type ProxyStats = {
   accepted: number;
@@ -34,6 +43,12 @@ export type ProxyStats = {
   refusedNoName: number;
   refusedNoPin: number;
   refusedBadPin: number;
+  /** Origins turned away for negotiating a classical group, under requirePq. */
+  refusedClassical: number;
+  /** Upstream legs whose key exchange was a post-quantum hybrid. */
+  pqSessions: number;
+  /** Upstream legs that fell back to a classical group. */
+  classicalSessions: number;
   upstreamErrors: number;
 };
 
@@ -53,6 +68,17 @@ export function createProxy(options: {
   listenPort?: number;
   tlds: string[];
   tofu?: boolean;
+  /**
+   * Refuse an origin whose key exchange was not post-quantum.
+   *
+   * Off by default, and it has to stay that way for now: an origin on
+   * OpenSSL < 3.5 has no ML-KEM and would go dark the moment this flipped.
+   * Turn it on once the grid is known to be on 3.5, using the counters below
+   * to find out. The caller must only pass true when `probeDetector()` came
+   * back usable — enforcing on a signal that has not been proven is worse
+   * than not enforcing at all.
+   */
+  requirePq?: boolean;
   connectTimeoutMs?: number;
   idleTimeoutMs?: number;
   log?: (line: string) => void;
@@ -63,12 +89,14 @@ export function createProxy(options: {
   const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
   const idleTimeoutMs = options.idleTimeoutMs ?? 120_000;
   const tofu = options.tofu ?? false;
+  const requirePq = options.requirePq ?? false;
   const log = options.log ?? (() => {});
   const suffixes = options.tlds.map((t) => `.${t.replace(/^\.+/, "").toLowerCase()}`);
 
   const stats: ProxyStats = {
     accepted: 0, verified: 0,
-    refusedNoName: 0, refusedNoPin: 0, refusedBadPin: 0, upstreamErrors: 0,
+    refusedNoName: 0, refusedNoPin: 0, refusedBadPin: 0, refusedClassical: 0,
+    pqSessions: 0, classicalSessions: 0, upstreamErrors: 0,
   };
 
   function inNamespace(name: string): boolean {
@@ -182,8 +210,32 @@ export function createProxy(options: {
         return;
       }
 
+      // Identity is settled; now record what kind of key exchange carried it.
+      // This is checked after the pin on purpose — an origin that failed
+      // verification learns nothing about the policy it would have faced.
+      const kx = describeKeyExchange(upstream);
+      const kxLabel = kx.postQuantum ? "hybrid-pq" : `classical/${kx.group ?? "unknown"}`;
+
+      if (kx.postQuantum) {
+        stats.pqSessions++;
+      } else {
+        stats.classicalSessions++;
+        if (requirePq) {
+          stats.refusedClassical++;
+          log(`refuse ${name}: key exchange was ${kxLabel}, post-quantum required`);
+          upstream.destroy();
+          browser.destroy();
+          return;
+        }
+        // Not an error — the session is still confidential against everything
+        // that exists today. It is recorded because a transcript captured now
+        // is decryptable by a quantum adversary later, and the operator cannot
+        // fix what nobody told them about.
+        log(`warn ${name}: origin has no ML-KEM, fell back to ${kxLabel}`);
+      }
+
       stats.verified++;
-      log(`ok ${name} (${allowed?.source ?? "tofu"})`);
+      log(`ok ${name} (${allowed?.source ?? "tofu"}) ${kx.protocol ?? "?"} ${kxLabel}`);
 
       upstream.setTimeout(idleTimeoutMs, () => upstream.destroy());
       browser.resume();

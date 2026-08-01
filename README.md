@@ -140,6 +140,45 @@ whenever we like — no CA, no root program, no CA/B ballot. Browsers don't
 support PQ signatures in TLS yet, but the proxy terminates for the browser, so
 the proxy↔origin leg can run ML-DSA before the public web can.
 
+### It is on by default, and that is measured
+
+The proxy configures no groups at all — the origin leg uses Node's defaults.
+On Node 24 against OpenSSL 3.5 those defaults already put the hybrid first and
+send a real ML-KEM key share in the first flight. Read off the wire from the
+ClientHello the proxy actually sends:
+
+```
+supported_groups: X25519MLKEM768, x25519, secp256r1, x448, secp384r1, ...
+key_share sent  : X25519MLKEM768(1216B), x25519(32B)
+```
+
+### The gap was that nobody could tell when it didn't happen
+
+An origin on OpenSSL 3.0–3.4 — what Ubuntu 22.04 and 24.04 still ship — has no
+ML-KEM, so the handshake silently falls back to `x25519` and succeeds. The
+session is fine against every adversary that exists today and decryptable by one
+that doesn't yet. Nothing said so, which made the guarantee unobservable.
+
+Every upstream leg is now classified and counted:
+
+```
+[proxy] ok scrambled.eggs (registry) TLSv1.3 hybrid-pq
+[proxy] warn old.eggs: origin has no ML-KEM, fell back to classical/X25519
+...
+[proxy] 41 post-quantum, 3 classical
+```
+
+`MOSHPIT_PROXY_REQUIRE_PQ=1` turns the fallback into a refusal. **Leave it off
+until the counters say the grid is ready** — switching it on today takes every
+pre-3.5 origin offline.
+
+Node exposes no binding for `SSL_get_negotiated_group()`, so the group is read
+through `getEphemeralKeyInfo()`, which cannot represent a hybrid KEM and returns
+`{}` for one while naming any classical group. That is an inference from an
+absence, so it is never trusted on faith: two loopback handshakes at startup
+prove both halves of the mapping, the result is printed, and enforcement refuses
+to engage if the proof fails. See `lib/pq.ts`.
+
 ## Why Node and not Bun
 
 The rest of the Moshpit stack is Bun. This is not, and the reason is specific

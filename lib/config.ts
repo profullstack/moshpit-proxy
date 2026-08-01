@@ -17,6 +17,7 @@ export type Config = {
   dir: string;
   tlds: string[];
   tofu: boolean;
+  requirePq: boolean;
   overrides: Record<string, string[]>;
   logging: boolean;
 };
@@ -39,6 +40,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // connection into an act of faith; it exists so a grid can come up before
     // the registry serves pins, not because it is good.
     tofu: truthy(env.MOSHPIT_PROXY_TOFU),
+    // Off by default because turning it on takes every origin without ML-KEM
+    // offline, and today that is most of them — anything on OpenSSL below 3.5,
+    // which includes what Ubuntu 22.04 and 24.04 ship. Run without it first and
+    // read the pq/classical counters at shutdown to find out where the grid is.
+    requirePq: truthy(env.MOSHPIT_PROXY_REQUIRE_PQ),
     overrides: loadOverrides(env.MOSHPIT_PROXY_PINS || join(dir, "pins.json")),
     logging: truthy(env.MOSHPIT_PROXY_LOG ?? "1"),
   };
