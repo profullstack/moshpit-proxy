@@ -144,12 +144,45 @@ Node, Python and Java keep their own trust stores — `NODE_EXTRA_CA_CERTS`,
 `certifi`, `cacerts` respectively. Installing into the OS store does not cover
 them, and neither does `moshpit-trust`.
 
+## Serving a name (site operators)
+
+On the box that will host the name — a VPS, a droplet, anything with a public
+address:
+
+```sh
+sudo sh scripts/setup-origin.sh chovy.hacker
+```
+
+Generates a key and self-signed certificate, writes an nginx server block from
+`nginx/moshpit-origin.conf`, reloads, connects back to itself to prove the name
+now answers with the key it just made, and prints the pin to publish. `--dry-run`
+shows what it would do.
+
+Self-signed is the design, not a shortcut: no CA will issue for a Moshpit TLD, so
+identity comes from the registry rather than an issuer. Nothing about the
+certificate is checked except the key, so an expensive one and this one are worth
+exactly the same here.
+
+**The failure this is built to prevent:** a name with no matching server block
+falls through to nginx's default vhost, which answers with a certificate for some
+other name entirely. The browser reports an invalid certificate and the site looks
+broken, when what is broken is one missing `server_name`. The script connects back
+and checks, rather than trusting that a clean `nginx -t` means the name resolves
+to the right block.
+
+Nothing is proxied on the server side. `moshpit-proxy` runs on the *visitor's*
+machine — it is the thing that checks the pin on behalf of a browser that cannot.
+
 ## Publishing a pin (site operators)
 
 ```sh
 npx moshpit-pin ./origin.crt        # from a file
 npx moshpit-pin scrambled.eggs:443  # from what a live server presents
 ```
+
+`setup-origin.sh` prints this for you. Until the pin is published every client
+refuses the name — there is no TOFU and no unauthenticated mode, because the pin
+stands exactly where a certificate authority would.
 
 Publish the result at [app.moshcode.sh/pit/dns](https://app.moshcode.sh/pit/dns).
 Keep the previous pin listed alongside the new one while rotating — the client
