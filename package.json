@@ -7,11 +7,13 @@
   "description": "Registry-pinned TLS proxy for Moshpit names. Verifies the origin's key against the registry instead of a certificate authority.",
   "bin": {
     "moshpit-proxy": "bin/moshpit-proxy.ts",
-    "moshpit-pin": "bin/moshpit-pin.ts"
+    "moshpit-pin": "bin/moshpit-pin.ts",
+    "moshpit-trust": "bin/moshpit-trust.ts"
   },
   "scripts": {
     "start": "node bin/moshpit-proxy.ts",
     "pin": "node bin/moshpit-pin.ts",
+    "trust": "node bin/moshpit-trust.ts",
     "upstreams": "node scripts/gen-upstreams.ts",
     "test": "node --test tests/*.test.ts"
   },
