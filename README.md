@@ -316,3 +316,45 @@ and Apache-2.0 carries an explicit patent grant where MIT is silent. Implement
 the pin scheme however you like; the NOTICE covers naming.
 
 Security policy and the trust model behind the local CA: [SECURITY.md](SECURITY.md).
+
+## Resolving Moshpit names on a machine (`systemd/`)
+
+`systemd/moshpit-dns.service` and `systemd/00-moshpit.conf` are the deployed
+resolver setup, kept here because they were previously configured by hand on
+each box and existed in no repository.
+
+```sh
+cp systemd/moshpit-dns.service /etc/systemd/system/
+cp systemd/00-moshpit.conf     /etc/systemd/resolved.conf.d/
+systemctl daemon-reload && systemctl enable --now moshpit-dns
+systemctl restart systemd-resolved
+```
+
+The bridge runs as this machine's **primary** resolver, with no list of Moshpit
+endings anywhere. That is not a shortcut — a per-TLD list cannot be made to work:
+
+- **It does not scale.** `moshcode dns install --write` emits every claimed
+  ending as a routing domain — 5,661 of them on one line. systemd-resolved caps
+  search domains near 1090 and drops the rest alphabetically, logging thousands
+  of `Failed to add search domain '~zoology': Argument list too long`. Endings
+  past the cut are configured on disk and absent from the resolver.
+- **Curating the list does not fix it either.** A routing domain selects a
+  *scope*, and a scope tries its servers in order. With an upstream resolver in
+  the same scope, `.hacker` goes there first, comes back NXDOMAIN, and
+  systemd-resolved treats that as final — the bridge is never asked.
+
+Sending every query to the bridge removes both problems. It answers Moshpit
+names from the registry and forwards everything else upstream (`mode=clearnet`:
+the ordinary internet owns any name it can answer; the registry is a backfill).
+
+The drop-in is named `00-` so it is read first: systemd-resolved appends `DNS=`
+in filename order and uses the first server, rotating only on *failure* — never
+on NXDOMAIN. So any pre-existing resolvers stay listed as a genuine fallback for
+if the bridge stops, rather than shadowing it.
+
+**Do not set `MOSHPIT_DNS_CATCHALL=1` here.** It parks every unresolved name on
+the registry's parking address, which on a machine's own resolver means
+`github.com` resolves to a parking page. Correct startup logs say `mode=clearnet`.
+If clearnet names start resolving to a `69.46.46.x` address, check for a stray
+`moshcode dns start` bound to `127.0.0.1:5354` — a loopback bind beats the
+service's `0.0.0.0` bind and wins every local query.
