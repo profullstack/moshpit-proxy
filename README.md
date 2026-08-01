@@ -170,6 +170,34 @@ broken, when what is broken is one missing `server_name`. The script connects ba
 and checks, rather than trusting that a clean `nginx -t` means the name resolves
 to the right block.
 
+### One command, including the registry
+
+`setup-origin.sh` stops at printing the pin because publishing it needs an
+account. With an API key it does not stop:
+
+```sh
+MOSHPIT_API_KEY=... sh scripts/setup-origin.sh chovy.hacker \
+  --target dev.profullstack.com
+```
+
+Key, certificate, nginx block, reload, verify, **publish the pin, set the
+target, and read it back from the registry** — the whole of "serve this name".
+Get a key at [app.moshcode.sh/settings](https://app.moshcode.sh/settings).
+
+This works because `/api/moshpit` accepts a bearer token as well as a cookie
+session, so nothing here needs a browser. Without a key the script behaves
+exactly as before and prints the pin for you to paste.
+
+The read-back at the end is the point. A `201` means the write was accepted;
+only a read proves the endpoint clients actually query returns it, and a pin
+that was accepted but is not served leaves the name refused with nothing to
+show for it.
+
+**`--target` will not take an IPv4 literal**, because the registry refuses one
+by design — an A record on a small host is leased, NATed or shared, and a name
+pointed at one goes stale silently. Use a hostname: the address behind it is
+resolved normally, which is also how a name reaches IPv4-only clients.
+
 Nothing is proxied on the server side. `moshpit-proxy` runs on the *visitor's*
 machine — it is the thing that checks the pin on behalf of a browser that cannot.
 

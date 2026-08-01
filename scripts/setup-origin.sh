@@ -13,6 +13,15 @@
 # for the name and clients checking the key they were handed against it. Which
 # means the last step is not optional: until the pin is published, every client
 # refuses the name rather than trusting it on sight.
+#
+# With MOSHPIT_API_KEY set, that last step stops being manual:
+#
+#   MOSHPIT_API_KEY=... sh setup-origin.sh chovy.hacker --target dev.profullstack.com
+#
+# publishes the pin and sets the target over the registry API, so the whole of
+# "serve this name" is one command. Get a key at app.moshcode.sh/settings.
+# Without the key nothing changes -- it prints the pin and tells you where to
+# paste it, exactly as before.
 set -eu
 
 NAME="${1:-}"
@@ -22,6 +31,9 @@ ENABLEDIR="${MOSHPIT_ENABLEDIR:-/etc/nginx/sites-enabled}"
 WEBROOT="${MOSHPIT_WEBROOT:-/var/www/$NAME}"
 DAYS="${MOSHPIT_DAYS:-825}"
 TEMPLATE="${MOSHPIT_TEMPLATE:-$(dirname "$0")/../nginx/moshpit-origin.conf}"
+API_KEY="${MOSHPIT_API_KEY:-}"
+REGISTRY="${MOSHPIT_REGISTRY:-https://app.moshcode.sh}"
+TARGET=""
 DRY_RUN=0
 
 RED=''; BOLD=''; DIM=''; OFF=''
@@ -32,23 +44,40 @@ warn() { printf '%swarning:%s %s\n' "$RED" "$OFF" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+usage() {
+  cat >&2 <<EOF
+usage: setup-origin.sh <name> [options]
+
+  --dry-run          write nothing, print what would happen
+  --days <n>         certificate lifetime  (default: $DAYS)
+  --webroot <dir>    site files            (default: /var/www/<name>)
+  --api-key <token>  publish the pin instead of printing it for a human
+  --target <addr>    also set the name's "points at" (needs --api-key)
+  --registry <url>   registry base         (default: $REGISTRY)
+
+An IPv4 literal is refused by the registry by design -- point a name at an
+IPv6 address or a hostname. A hostname is how a name reaches IPv4 clients,
+since the address behind it is resolved normally.
+
+environment: MOSHPIT_CERTDIR, MOSHPIT_SITEDIR, MOSHPIT_ENABLEDIR, MOSHPIT_WEBROOT,
+             MOSHPIT_API_KEY, MOSHPIT_REGISTRY
+EOF
+}
+
+# Before the name is consumed, or `--help` is read as the name and the script
+# dies telling you that `--help` is not a Moshpit name.
+case "$NAME" in -h|--help) usage; exit 0 ;; esac
+
 shift 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --days)    DAYS="${2:?--days needs a number}"; shift ;;
     --webroot) WEBROOT="${2:?--webroot needs a path}"; shift ;;
-    -h|--help)
-      cat >&2 <<EOF
-usage: setup-origin.sh <name> [options]
-
-  --dry-run          write nothing, print what would happen
-  --days <n>         certificate lifetime  (default: $DAYS)
-  --webroot <dir>    site files            (default: /var/www/<name>)
-
-environment: MOSHPIT_CERTDIR, MOSHPIT_SITEDIR, MOSHPIT_ENABLEDIR, MOSHPIT_WEBROOT
-EOF
-      exit 0 ;;
+    --api-key) API_KEY="${2:?--api-key needs a token}"; shift ;;
+    --target)  TARGET="${2:?--target needs an address or hostname}"; shift ;;
+    --registry) REGISTRY="${2:?--registry needs a base URL}"; shift ;;
+    -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -60,6 +89,19 @@ case "$NAME" in
   *) die "'$NAME' does not look like a Moshpit name" ;;
 esac
 have openssl || die "openssl is required"
+
+# Caught here rather than after the certificate exists, so a typo does not leave
+# a half-configured name behind.
+if [ -n "$TARGET" ] && [ -z "$API_KEY" ]; then
+  die "--target needs --api-key (or MOSHPIT_API_KEY) — the target is set through the registry API"
+fi
+case "$TARGET" in
+  *://*) die "--target takes a bare address or hostname, not a URL" ;;
+  # An IPv4 literal is refused by the registry by design; saying so here saves a
+  # round trip and explains the fix, which the API's own error does not.
+  [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+    die "--target will not accept an IPv4 literal — use a hostname that resolves to it (the registry stores IPv6 or hostnames)" ;;
+esac
 [ -f "$TEMPLATE" ] || die "template not found: $TEMPLATE"
 
 if [ "$DRY_RUN" = "0" ] && [ "$(id -u)" != "0" ]; then
@@ -194,13 +236,70 @@ else
   PIN="(dry run — no key was generated)"
 fi
 
-cat >&2 <<EOF
+TLD="${NAME#*.}"
+LABEL="${NAME%%.*}"
+
+# ------------------------------------------------------- publish it, or don't
+
+# `/api/moshpit` accepts a bearer token as well as a cookie session, so the last
+# step does not have to be a human in a browser. Without a key this prints the
+# pin and where to paste it, which is all it ever did.
+if [ -n "$API_KEY" ] && [ "$DRY_RUN" = "0" ]; then
+  have curl || die "curl is required to publish (or drop --api-key and paste it yourself)"
+
+  # `-w` appends the status on its own line so the body stays intact; the API
+  # explains its own failures, and swallowing that is how the dashboard turned
+  # "you do not own this" into a form that silently did nothing.
+  api() {
+    _method="$1"; _path="$2"; _body="$3"
+    curl -sS -X "$_method" "$REGISTRY$_path" \
+      -H "authorization: Bearer $API_KEY" \
+      -H "content-type: application/json" \
+      -d "$_body" -w '\n%{http_code}' 2>&1
+  }
+  ok_status() { case "$1" in 2*) return 0 ;; *) return 1 ;; esac; }
+  report() {
+    _what="$1"; _out="$2"
+    _code=$(printf '%s' "$_out" | tail -n1)
+    _body=$(printf '%s' "$_out" | sed '$d')
+    if ok_status "$_code"; then
+      say "  ${DIM}$_what — ok ($_code)${OFF}"
+      return 0
+    fi
+    warn "$_what failed ($_code): $_body"
+    return 1
+  }
+
+  if [ -n "$TARGET" ]; then
+    step "pointing $NAME at $TARGET"
+    report "target" "$(api PUT "/api/moshpit/tlds/$TLD/names" \
+      "{\"label\":\"$LABEL\",\"target\":\"$TARGET\"}")" || true
+  fi
+
+  step "publishing the pin"
+  # 409 means this exact pin is already published under a different kind, which
+  # is a real mistake worth surfacing rather than a retry.
+  report "pin" "$(api POST "/api/moshpit/tlds/$TLD/pins" \
+    "{\"label\":\"$LABEL\",\"pin\":\"$PIN\",\"kind\":\"tls\",\"note\":\"setup-origin.sh\"}")" || true
+
+  # Read it back. A 201 means the write was accepted; only a read proves the
+  # thing clients actually query now returns it.
+  step "confirming the registry serves it"
+  published=$(curl -sS "$REGISTRY/api/moshpit/tlds/$TLD/pins?label=$LABEL" 2>/dev/null || true)
+  case "$published" in
+    *"$PIN"*) say "  ${DIM}$NAME is published and verifiable${OFF}" ;;
+    *)        warn "the registry does not list this pin yet: $published"
+              warn "clients will keep refusing $NAME until it does" ;;
+  esac
+else
+  cat >&2 <<EOF
 
   ${BOLD}$NAME${OFF}
   $PIN
 
   Publish it at https://app.moshcode.sh/pit
-  ${DIM}sign in · the "Yours" tab · "Key pins" on .${NAME#*.}${OFF}
+  ${DIM}or re-run with MOSHPIT_API_KEY set and this happens by itself —
+  get a key at ${REGISTRY}/settings${OFF}
 
   Until you do, every client refuses this name — that is the design, not a
   fault. There is no trust-on-first-use and no unauthenticated mode, because
@@ -209,3 +308,4 @@ cat >&2 <<EOF
   ${DIM}Rotating later? Publish the new pin alongside the old one, switch the
   server, then drop the old one. Clients accept any pin in the list.${OFF}
 EOF
+fi
