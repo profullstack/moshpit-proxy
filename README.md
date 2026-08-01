@@ -184,7 +184,16 @@ npx moshpit-pin scrambled.eggs:443  # from what a live server presents
 refuses the name — there is no TOFU and no unauthenticated mode, because the pin
 stands exactly where a certificate authority would.
 
-Publish the result at [app.moshcode.sh/pit/dns](https://app.moshcode.sh/pit/dns).
+Publish the result at [app.moshcode.sh/pit](https://app.moshcode.sh/pit) — sign
+in, open the **Yours** tab, and use **Key pins** on the TLD.
+
+Not `/pit/dns`, which this file used to say. That page is the instructions for
+pointing a *machine's resolver* at Moshpit — it has no pin form on it, so the
+old link sent operators somewhere they could never finish the job.
+
+The same page is where a name's **points at** target lives, which is the other
+half of making a name reachable.
+
 Keep the previous pin listed alongside the new one while rotating — the client
 accepts any pin in the list, so a key can change without a flag day.
 

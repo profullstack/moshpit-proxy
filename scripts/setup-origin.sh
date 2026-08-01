@@ -199,7 +199,8 @@ cat >&2 <<EOF
   ${BOLD}$NAME${OFF}
   $PIN
 
-  Publish it at https://app.moshcode.sh/pit/dns
+  Publish it at https://app.moshcode.sh/pit
+  ${DIM}sign in · the "Yours" tab · "Key pins" on .${NAME#*.}${OFF}
 
   Until you do, every client refuses this name — that is the design, not a
   fault. There is no trust-on-first-use and no unauthenticated mode, because
