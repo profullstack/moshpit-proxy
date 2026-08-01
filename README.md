@@ -70,7 +70,37 @@ loopback.
 | `MOSHPIT_PROXY_TOFU` | off | see below |
 | `MOSHPIT_PROXY_DIR` | `~/.moshpit` | |
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/profullstack/moshpit-proxy/main/install.sh | sh
+```
+
+Installs under `~/.local`, needs no root for the code, and finishes by setting up
+your browsers — asking once, in plain language, before it changes anything:
+
+```
+  Moshpit needs to add a security key to this
+  computer so your browser trusts .moshpit sites.
+  It only works for .moshpit and cannot affect any
+  other website.
+
+  Continue? [Y/n]
+```
+
+`--no-trust` installs the code only. `--uninstall` removes both.
+
+Already have the code? `moshpit-trust` does the browser setup on its own, and
+`moshpit-trust --status` says what is set up without changing anything. It is
+idempotent — running it twice is a no-op, not a duplicate.
+
+> **Nothing in this section applies to [TronBrowser](https://tronbrowser.dev)**,
+> which verifies registry pins natively. No setup, no proxy, no local root.
+
 ## Trusting the local root
+
+`moshpit-trust` automates everything below; this section is what it does and why,
+for anyone who would rather do it by hand or wants to know what changed.
 
 The proxy generates a root on first run at `~/.moshpit/ca/ca.crt` and prints its
 fingerprint. Two things make installing it a much smaller ask than a shared CA:
@@ -86,15 +116,33 @@ That second property is tested, not asserted — `tests/ca.test.ts` signs a
 with `permitted subtree violation`.
 
 ```sh
-# Linux (NSS: Chrome, Firefox)
+# Linux (NSS: Chrome, Chromium, Edge)
 certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Moshpit Local CA" -i ~/.moshpit/ca/ca.crt
 # macOS
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.moshpit/ca/ca.crt
 ```
 
+`C,,` is server-trust only — not code signing, not mail.
+
+**Firefox is not covered by either command.** It carries its own NSS database per
+profile on every platform, including macOS, so the keychain does nothing for it:
+
+```sh
+certutil -d sql:~/.mozilla/firefox/<profile> -A -t "C,," -n "Moshpit Local CA" -i ~/.moshpit/ca/ca.crt
+```
+
+On current Ubuntu the default Firefox is the snap, whose profiles live under
+`~/snap/firefox/common/.mozilla/firefox/` instead. `moshpit-trust` covers the
+snap and flatpak paths as well, which is most of why doing this by hand tends to
+half-work.
+
+`certutil` itself is not installed by default on Debian or Ubuntu — the command
+above fails on a machine that *does* have the store it points at. Install
+`libnss3-tools` (Debian/Ubuntu), `nss-tools` (Fedora/RHEL) or `nss` (Arch, brew).
+
 Node, Python and Java keep their own trust stores — `NODE_EXTRA_CA_CERTS`,
 `certifi`, `cacerts` respectively. Installing into the OS store does not cover
-them.
+them, and neither does `moshpit-trust`.
 
 ## Publishing a pin (site operators)
 
