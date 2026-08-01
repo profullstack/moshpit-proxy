@@ -139,12 +139,29 @@ fi
 # running server what it actually presents for this name.
 if [ "$DRY_RUN" = "0" ]; then
   step "checking what the server now presents for $NAME"
-  presented=$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$NAME" 2>/dev/null \
-    | openssl x509 -noout -subject 2>/dev/null || true)
+
+  # Retried, because `nginx -s reload` returns as soon as the signal is sent,
+  # not when the new workers are serving. The old workers finish their existing
+  # connections first, so a check fired immediately gets answered by the config
+  # from *before* the reload — which looks exactly like the default-vhost bug
+  # this is here to catch. Found the hard way: the first live run of this script
+  # reported a name mismatch that had already been fixed.
+  presented=""
+  attempt=1
+  while [ "$attempt" -le 5 ]; do
+    presented=$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$NAME" 2>/dev/null \
+      | openssl x509 -noout -subject 2>/dev/null || true)
+    case "$presented" in
+      *"$NAME"*) break ;;
+    esac
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+
   case "$presented" in
     *"$NAME"*) say "  ${DIM}$presented${OFF}" ;;
     "")        warn "could not read a certificate back from 127.0.0.1:443" ;;
-    *)         warn "the server answered '$NAME' with: $presented"
+    *)         warn "after 5 tries the server still answers '$NAME' with: $presented"
                warn "another server block is matching first — check for a default_server" ;;
   esac
 fi
