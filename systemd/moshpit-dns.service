@@ -1,0 +1,51 @@
+[Unit]
+# The Moshpit resolver, running as this machine's primary DNS.
+#
+# Primary rather than a side-channel on purpose. systemd-resolved cannot do
+# split-horizon within one scope: a routing domain sends the query to a scope,
+# and the scope tries its servers in order, so an upstream that answers NXDOMAIN
+# for `.hacker` ends the lookup before the bridge is ever asked. Listing every
+# Moshpit ending in `Domains=` was the workaround, and it does not scale --
+# systemd-resolved caps search domains at ~1090 and silently drops the rest.
+#
+# So the bridge answers everything and forwards what is not a Moshpit name.
+# There is no domain list to maintain, nothing to regenerate, and no cap.
+#
+# MOSHPIT_DNS_CATCHALL is deliberately NOT set. It parks every unresolved name
+# on the registry's parking address, which for a machine's own resolver means
+# github.com resolves to a parking page. That mode belongs on the public parking
+# responder, not here.
+Description=Moshpit DNS bridge (primary resolver)
+Documentation=https://github.com/profullstack/moshpit-proxy
+After=network-online.target
+Wants=network-online.target
+Before=systemd-resolved.service
+
+[Service]
+Type=simple
+User=anthony
+Group=anthony
+WorkingDirectory=/home/anthony/moshpit-dns
+Environment=MOSHPIT_DNS_PORT=5354
+Environment=MOSHPIT_DNS_HTTP_PORT=8053
+Environment=MOSHPIT_DNS_LOG=queries
+ExecStart=/home/anthony/.local/share/mise/installs/bun/latest/bin/bun run scripts/moshpit-dns.ts
+
+# It is the resolver now. If it dies, name resolution for Moshpit names dies
+# with it, so it comes back rather than staying dead like the orphaned process
+# this replaced.
+Restart=always
+RestartSec=2
+
+# Unprivileged: it binds 5354, not 53.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/anthony/moshpit-dns
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
