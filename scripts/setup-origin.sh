@@ -138,6 +138,22 @@ fi
 # certificate — which is exactly the bug this script exists to fix. So ask the
 # running server what it actually presents for this name.
 if [ "$DRY_RUN" = "0" ]; then
+  # Adding a block to a box that already serves other sites can silently steal
+  # the default vhost. nginx picks the first-parsed server for a listen address
+  # when nothing is marked `default_server`, and files in sites-enabled are
+  # parsed in filename order -- so `chovy.hacker` sorts ahead of `userdirs.conf`
+  # and becomes the default. Every request with no SNI or an unmatched Host then
+  # gets this name's self-signed certificate instead of whatever the box used to
+  # answer with, which looks like the *other* sites broke.
+  #
+  # Found by doing exactly this to a live server.
+  if [ "$(nginx -T 2>/dev/null | grep -c 'listen.*443.*default_server')" = "0" ]; then
+    warn "no server block on this box marks itself \`default_server\` for 443."
+    warn "adding $NAME may have taken over as the default vhost, so requests"
+    warn "with no SNI or an unmatched Host now get its self-signed certificate."
+    warn "fix by marking the intended default, e.g. \`listen 443 ssl default_server;\`"
+  fi
+
   step "checking what the server now presents for $NAME"
 
   # Retried, because `nginx -s reload` returns as soon as the signal is sent,
