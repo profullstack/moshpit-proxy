@@ -1,0 +1,16 @@
+[Unit]
+# Merging should ship. Before this, /opt/moshpit was a hand-copied nginx/ and
+# scripts/, so a merged fix reached the box only when somebody remembered to
+# copy it — and forgetting does not produce an error, it produces a fix that
+# appears not to work.
+Description=Update /opt/moshpit to the tip of moshpit-proxy
+Documentation=https://github.com/profullstack/moshpit-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/moshpit/scripts/moshpit-update.sh
+# A failed update must leave the box exactly as it was, which the script
+# guarantees; systemd only needs to not retry into a loop.
+Restart=no

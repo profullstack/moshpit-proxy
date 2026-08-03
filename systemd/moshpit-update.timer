@@ -1,0 +1,16 @@
+[Unit]
+Description=Update /opt/moshpit periodically
+Documentation=https://github.com/profullstack/moshpit-proxy
+
+[Timer]
+# Every 15 minutes rather than every minute like reconcile: this reaches the
+# network and a merge is not urgent, where an unserved name is.
+OnBootSec=2min
+OnUnitActiveSec=15min
+# Spread across boxes so a merge does not have every origin fetch at once.
+RandomizedDelaySec=2min
+# A box that was off must still catch up rather than wait a full interval.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
