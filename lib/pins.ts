@@ -18,7 +18,20 @@
 // between a pinning scheme people use and one they turn off.
 
 export type PinSource = "override" | "registry" | "tofu";
-export type PinLookup = { name: string; pins: string[]; source: PinSource };
+export type PinLookup = {
+  name: string;
+  pins: string[];
+  source: PinSource;
+  /**
+   * Where the name's owner points it, when the registry says.
+   *
+   * Carried so the proxy can open the origin directly instead of relaying
+   * through the gateway. It is not trusted as an identity — the pin is still
+   * the only thing that decides whether the connection lives — it only says
+   * which address to dial.
+   */
+  target?: string;
+};
 
 export type PinClient = {
   lookup(name: string): Promise<PinLookup | null>;
@@ -92,7 +105,7 @@ export function createPinClient(options: {
       }
       if (!res.ok) throw new Error(`registry responded ${res.status}`);
 
-      const json = (await res.json()) as { name?: unknown; pins?: unknown };
+      const json = (await res.json()) as { name?: unknown; pins?: unknown; target?: unknown };
       const pins = Array.isArray(json?.pins)
         ? json.pins.filter((p): p is string => typeof p === "string" && p.length > 0)
         : [];
@@ -101,10 +114,15 @@ export function createPinClient(options: {
         return null;
       }
 
+      // Spread rather than `target: … : undefined`, so a name with no target
+      // has no `target` key at all. An own property set to undefined is not
+      // deep-equal to an absent one, and callers compare these.
+      const target = typeof json.target === "string" ? json.target.trim() : "";
       const value: PinLookup = {
         name: typeof json.name === "string" ? json.name : name,
         pins,
         source: "registry",
+        ...(target ? { target } : {}),
       };
       remember(name, value, ttlMs);
       return value;

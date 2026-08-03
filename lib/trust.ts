@@ -25,7 +25,7 @@
 // and installing twice is a no-op rather than a duplicate nickname.
 
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -35,7 +35,26 @@ const execFileAsync = promisify(execFile);
 /** The nickname the root is filed under. Stable — it is how we find it again. */
 export const NICKNAME = "Moshpit Local CA";
 
-export type StoreKind = "nss" | "macos-keychain";
+export type StoreKind = "nss" | "macos-keychain" | "ca-certificates";
+
+/**
+ * Where a Linux distribution wants extra roots dropped, and what refreshes the
+ * bundle afterwards. The file is written into `dir`; the command rebuilds
+ * /etc/ssl/certs from it.
+ *
+ * This is the store `curl`, `wget`, `git` and Node read — none of which look at
+ * NSS. Covering only browsers meant `curl <name>` failed with a self-signed
+ * certificate error on a machine that had been "set up", which reads as the
+ * whole scheme being broken rather than as one store having been missed.
+ */
+export const CA_CERTIFICATES_DIRS: Array<{ dir: string; refresh: string }> = [
+  // Debian, Ubuntu and derivatives.
+  { dir: "/usr/local/share/ca-certificates", refresh: "update-ca-certificates" },
+  // Fedora, RHEL, CentOS, Rocky, Alma.
+  { dir: "/etc/pki/ca-trust/source/anchors", refresh: "update-ca-trust" },
+  // Arch, and openSUSE via p11-kit.
+  { dir: "/etc/ca-certificates/trust-source/anchors", refresh: "update-ca-trust" },
+];
 
 export type Store = {
   /** Stable id, used in output and in tests. */
@@ -57,6 +76,10 @@ export type TrustEnv = {
   exists: (path: string) => boolean;
   listDir: (path: string) => string[];
   run: Runner;
+  /** Empty string when the file cannot be read, so callers never have to catch. */
+  readFile: (path: string) => string;
+  copyFile: (from: string, to: string) => void;
+  removeFile: (path: string) => void;
 };
 
 export function defaultEnv(overrides: Partial<TrustEnv> = {}): TrustEnv {
@@ -64,6 +87,15 @@ export function defaultEnv(overrides: Partial<TrustEnv> = {}): TrustEnv {
     platform: osPlatform(),
     home: homedir(),
     exists: existsSync,
+    readFile: (path) => {
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        return "";
+      }
+    },
+    copyFile: (from, to) => copyFileSync(from, to),
+    removeFile: (path) => rmSync(path, { force: true }),
     listDir: (path) => {
       try {
         return readdirSync(path);
@@ -105,6 +137,20 @@ export function discoverStores(env: TrustEnv = defaultEnv()): Store[] {
         path: nssdb,
         label: "Chrome, Chromium and Edge",
         needsRoot: false,
+      });
+    }
+
+    // The system bundle. First match wins: a machine has one of these, and
+    // writing a root into a second distribution's directory would leave a file
+    // nothing ever reads.
+    const anchors = CA_CERTIFICATES_DIRS.find((candidate) => env.exists(candidate.dir));
+    if (anchors) {
+      stores.push({
+        id: "ca-certificates",
+        kind: "ca-certificates",
+        path: anchors.dir,
+        label: "curl, wget, git and anything using the system store",
+        needsRoot: true,
       });
     }
   }
@@ -231,11 +277,50 @@ function osReleaseId(env: TrustEnv): string {
   }
 }
 
+/** The file this root is written as, inside a distribution's anchor directory. */
+export const ANCHOR_FILENAME = "moshpit-local-ca.crt";
+
+/**
+ * Bundles a refresh command regenerates. Checked so "installed" means the
+ * bundle actually contains the root, not merely that a file was dropped in a
+ * directory — `update-ca-certificates` skips a file whose name does not end in
+ * `.crt`, and exits zero while doing so.
+ */
+const SYSTEM_BUNDLES = [
+  "/etc/ssl/certs/ca-certificates.crt",
+  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+  "/etc/ssl/ca-bundle.pem",
+];
+
+/** The base64 body of a PEM, which is what to look for inside a bundle. */
+function pemBody(pem: string): string {
+  return pem
+    .split("\n")
+    .filter((line) => line.trim() && !line.startsWith("-----"))
+    .join("")
+    .trim();
+}
+
+function inSystemBundle(env: TrustEnv, anchor: string): boolean {
+  const body = pemBody(env.readFile(anchor));
+  // A short or absent body would match everything; treat it as not installed.
+  if (body.length < 64) return false;
+  const needle = body.slice(0, 64);
+  return SYSTEM_BUNDLES.some((bundle) => env.exists(bundle) && pemBody(env.readFile(bundle)).includes(needle));
+}
+
 export type StoreStatus = { store: Store; installed: boolean; detail: string };
 
 /** Whether this root is already trusted in `store`. Never writes. */
 export async function status(store: Store, env: TrustEnv = defaultEnv()): Promise<StoreStatus> {
   try {
+    if (store.kind === "ca-certificates") {
+      const anchor = join(store.path, ANCHOR_FILENAME);
+      if (!env.exists(anchor)) return { store, installed: false, detail: "not present" };
+      return inSystemBundle(env, anchor)
+        ? { store, installed: true, detail: "already trusted" }
+        : { store, installed: false, detail: "the file is there but the system bundle does not contain it" };
+    }
     if (store.kind === "nss") {
       await env.run("certutil", ["-d", `sql:${store.path}`, "-L", "-n", NICKNAME]);
       return { store, installed: true, detail: "already trusted" };
@@ -266,7 +351,14 @@ export async function install(
   if (before.installed) return { store, ok: true, changed: false, detail: "already trusted" };
 
   try {
-    if (store.kind === "nss") {
+    if (store.kind === "ca-certificates") {
+      const refresh = CA_CERTIFICATES_DIRS.find((c) => c.dir === store.path)?.refresh;
+      if (!refresh) return { store, ok: false, changed: false, detail: `no refresh command known for ${store.path}` };
+      // The .crt suffix is load-bearing on Debian: update-ca-certificates
+      // ignores anything else in this directory, silently and successfully.
+      env.copyFile(certPath, join(store.path, ANCHOR_FILENAME));
+      await env.run(refresh, []);
+    } else if (store.kind === "nss") {
       // "C,," — trusted to issue server certificates, and nothing else. Not
       // "CT,c,c" and not a mail or code-signing trust bit; this root has one job.
       await env.run("certutil", ["-d", `sql:${store.path}`, "-A", "-t", "C,,", "-n", NICKNAME, "-i", certPath]);
@@ -291,7 +383,13 @@ export async function uninstall(store: Store, env: TrustEnv = defaultEnv()): Pro
   if (!before.installed) return { store, ok: true, changed: false, detail: "was not present" };
 
   try {
-    if (store.kind === "nss") {
+    if (store.kind === "ca-certificates") {
+      const refresh = CA_CERTIFICATES_DIRS.find((c) => c.dir === store.path)?.refresh;
+      env.removeFile(join(store.path, ANCHOR_FILENAME));
+      // Without the refresh the anchor is gone but the bundle still trusts it,
+      // which is the worst of the three states.
+      if (refresh) await env.run(refresh, []);
+    } else if (store.kind === "nss") {
       await env.run("certutil", ["-d", `sql:${store.path}`, "-D", "-n", NICKNAME]);
     } else {
       await env.run("security", ["delete-certificate", "-c", NICKNAME, store.path]);

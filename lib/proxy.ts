@@ -30,6 +30,7 @@
 // answering ALPNCallback from cache — worth doing, not worth blocking on.
 // HTTP/3 would not survive a TCP proxy regardless.
 
+import { isIP } from "node:net";
 import { createSecureContext, createServer, connect } from "node:tls";
 import type { Server, TLSSocket } from "node:tls";
 import type { LocalCa } from "./ca.ts";
@@ -152,6 +153,34 @@ export function createProxy(options: {
     void verifyAndPipe(name, browser);
   });
 
+  /**
+   * Which host to open for a name: its own origin when the registry names one,
+   * the gateway otherwise.
+   *
+   * A target may carry a port (`example.com:8443`) and may be an IPv6 literal,
+   * which is why this is parsed rather than split on the first colon —
+   * `2604:a880::1` has plenty of colons and no port.
+   */
+  function upstreamFor(
+    allowed: { target?: string } | null,
+    gatewayHost: string,
+  ): { host: string; port?: number } {
+    const target = allowed?.target?.trim();
+    if (!target) return { host: gatewayHost };
+
+    const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(target);
+    if (bracketed) return { host: bracketed[1], port: bracketed[2] ? Number(bracketed[2]) : undefined };
+
+    // Bare IPv6 literal: colons belong to the address, not to a port.
+    if (isIP(target) === 6) return { host: target };
+
+    const colon = target.lastIndexOf(":");
+    if (colon > 0 && /^\d+$/.test(target.slice(colon + 1))) {
+      return { host: target.slice(0, colon), port: Number(target.slice(colon + 1)) };
+    }
+    return { host: target };
+  }
+
   async function verifyAndPipe(name: string, browser: TLSSocket) {
     const allowed = await options.pins.lookup(name);
     if (!allowed && !tofu) {
@@ -160,10 +189,26 @@ export function createProxy(options: {
       return;
     }
 
+    // Straight to the origin when the registry says where it is, and only
+    // through the gateway otherwise.
+    //
+    // Relaying through the gateway requires it to pass the connection through
+    // by SNI (`ssl_preread`) rather than terminate it. Where it terminates —
+    // which is what pit.moshcode.sh does today — every name presents the
+    // gateway's own certificate, so the pin never matches and the proxy
+    // correctly refuses every site. Three different names refused for the same
+    // presented key is the signature of that.
+    //
+    // Dialling the target changes nothing about trust: the pin is still the
+    // only thing that decides whether the connection survives, so a target
+    // pointed somewhere hostile fails the same check as anything else. It only
+    // removes a hop that has to be configured exactly right to work at all.
+    const upstreamHost = upstreamFor(allowed, options.gatewayHost);
     const upstream = connect({
-      host: options.gatewayHost,
-      port: gatewayPort,
-      // The SNI the gateway routes on. It is also the identity being pinned.
+      host: upstreamHost.host,
+      port: upstreamHost.port ?? gatewayPort,
+      // The SNI the origin (or the gateway) routes on. It is also the identity
+      // being pinned.
       servername: name,
       ALPNProtocols: ["http/1.1"],
       // Not "no verification" — different verification. The chain is
