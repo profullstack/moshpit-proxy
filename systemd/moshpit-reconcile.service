@@ -1,0 +1,42 @@
+# Serve every Moshpit name pointed at this box.
+#
+# Oneshot, driven by moshpit-reconcile.timer. Each pass asks the registry which
+# names point here and configures the ones that are not configured yet, so
+# pointing a name in the dashboard is the only step there is.
+#
+# Install:
+#   cp systemd/moshpit-reconcile.* /etc/systemd/system/
+#   systemctl enable --now moshpit-reconcile.timer
+
+[Unit]
+Description=Serve Moshpit names pointed at this host
+Documentation=https://github.com/profullstack/moshpit-proxy
+# Reconfiguring nginx is the point, so do not race its startup.
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/moshpit/scripts/moshpit-reconcile.sh --once
+
+# The API key lives here, not in this unit: unit files are world-readable and
+# `systemctl cat` prints them. 0600 the config instead.
+Environment=MOSHPIT_CONF=/etc/moshpit/reconcile.conf
+
+# A registry that is briefly unreachable is not a reason to give up until the
+# next tick, but retrying forever is not either.
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=3
+
+# It writes certificates, nginx config, and reloads nginx. That needs root, so
+# narrow what root can reach rather than pretending otherwise.
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

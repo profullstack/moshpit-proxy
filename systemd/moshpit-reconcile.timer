@@ -1,0 +1,26 @@
+# How often this box checks for names newly pointed at it.
+#
+# A minute is the gap between pointing a name in the dashboard and the site
+# being up. Passes with nothing to do cost one HTTPS request per ending and
+# change nothing on disk, so the cost of checking often is close to zero — and
+# the alternative is somebody ssh-ing in, which is the thing being removed.
+
+[Unit]
+Description=Check for Moshpit names newly pointed at this host
+Documentation=https://github.com/profullstack/moshpit-proxy
+
+[Timer]
+# Soon after boot, because a box that just came up may have missed changes.
+OnBootSec=30s
+OnUnitActiveSec=60s
+
+# Without this every box installed from the same instructions hits the registry
+# on the same second.
+RandomizedDelaySec=15s
+
+# A missed window (box asleep, timer disabled) should run once on return rather
+# than be skipped silently.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
