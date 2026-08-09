@@ -23,10 +23,15 @@
 # discovery would silently serve a subset and look like it had covered
 # everything. A box that serves three endings should say so in one line.
 #
-# Idempotent, and quiet when there is nothing to do: a name is reconfigured
-# only when its nginx block is missing or the pin the registry publishes is not
-# the key this box actually serves. Without that check every run would reload
+# Idempotent, and quiet when there is nothing to do: a name is reconfigured only
+# when its nginx block is missing, the pin the registry publishes is not the key
+# this box actually serves, or the certificate it serves is marked CA:TRUE and
+# so cannot be trusted by anything. Without those checks every run would reload
 # nginx, and a timer would reload it forever.
+#
+# The CA:TRUE trigger converges in one pass rather than firing forever: the
+# repair reuses the key, so the pin does not move and the next pass finds
+# nothing to do.
 set -eu
 
 CONF="${MOSHPIT_CONF:-/etc/moshpit/reconcile.conf}"
@@ -38,6 +43,10 @@ ENDINGS="${MOSHPIT_ENDINGS:-}"
 HOST="${MOSHPIT_HOST:-}"
 ENABLEDIR="${MOSHPIT_ENABLEDIR:-/etc/nginx/sites-enabled}"
 SETUP="${MOSHPIT_SETUP:-$(dirname "$0")/setup-origin.sh}"
+# Where to ask what this box is actually serving. Always the local nginx in
+# production; overridable so the certificate checks can be exercised against a
+# fixture server instead of requiring port 443 and root to test.
+ORIGIN_ADDR="${MOSHPIT_ORIGIN_ADDR:-127.0.0.1:443}"
 DRY_RUN=0
 FAILURES=0
 
@@ -80,11 +89,31 @@ points_here() {
 # The pin this box serves for a name, computed the same way the registry's
 # publisher computes it. Empty when nothing is listening for that name.
 served_pin() {
-  echo | openssl s_client -connect "127.0.0.1:443" -servername "$1" 2>/dev/null \
+  echo | openssl s_client -connect "$ORIGIN_ADDR" -servername "$1" 2>/dev/null \
     | openssl x509 -pubkey -noout 2>/dev/null \
     | openssl pkey -pubin -outform der 2>/dev/null \
     | openssl dgst -sha256 -binary 2>/dev/null \
     | openssl enc -base64 2>/dev/null
+}
+
+# Is the certificate this box serves for a name marked as a certificate
+# authority?
+#
+# The second repair trigger, and one the pin comparison structurally cannot see.
+# CA:TRUE is what openssl's `req -x509` produces by default, so every origin set
+# up before that default was overridden is serving one — and such a certificate
+# cannot be trusted directly, because an anchor marked CA:TRUE may issue for any
+# name rather than the one printed on it. A stock client is left with
+# "self-signed certificate" and no way forward.
+#
+# Re-issuing fixes it and reuses the key, so the pin does not move. That is what
+# makes the repair free, and it is also exactly why the check above stays silent
+# about it: serving and published agree, so a box would pull the fix and then
+# reconcile contentedly forever without ever applying it.
+served_is_ca() {
+  echo | openssl s_client -connect "$ORIGIN_ADDR" -servername "$1" 2>/dev/null \
+    | openssl x509 -noout -ext basicConstraints 2>/dev/null \
+    | grep -q 'CA:TRUE'
 }
 
 published_pin() {
@@ -113,6 +142,10 @@ reconcile_name() {
       # name outright. Worth naming both, because the usual cause is a
       # certificate regenerated without republishing.
       need="published pin does not match what is served ($publish vs $serving)"
+    elif served_is_ca "$name"; then
+      # Checked last because it is the expensive one and the rarest, and because
+      # a name failing any check above is going to be re-issued anyway.
+      need="the certificate it serves is marked CA:TRUE, which no client can safely trust"
     fi
   fi
 
