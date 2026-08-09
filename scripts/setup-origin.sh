@@ -5,8 +5,15 @@
 #
 # Generates a self-signed key pair for the name, writes an nginx server block
 # from nginx/moshpit-origin.conf, reloads, then connects back to itself and
-# proves the name now answers with the key it just made. Ends by printing the
-# pin to publish.
+# proves the name now answers with the key it just made. Trusts the result on
+# this machine, so the box that serves the name can also open it. Ends by
+# printing the pin to publish.
+#
+# Re-run it whenever you like. The key is reused, so the pin does not move and
+# the registry needs to hear nothing about it -- which is what makes repairing
+# an already-published certificate free:
+#
+#   sudo sh scripts/setup-origin.sh --all      # every name this box serves
 #
 # Self-signed is the design, not a shortcut. No CA will issue for a Moshpit TLD,
 # so identity comes from the registry publishing SHA-256(SubjectPublicKeyInfo)
@@ -35,6 +42,7 @@ API_KEY="${MOSHPIT_API_KEY:-}"
 REGISTRY="${MOSHPIT_REGISTRY:-https://app.moshcode.sh}"
 TARGET=""
 DRY_RUN=0
+TRUST_LOCAL=1
 
 RED=''; BOLD=''; DIM=''; OFF=''
 if [ -t 2 ]; then RED=$(printf '\033[31m'); BOLD=$(printf '\033[1m'); DIM=$(printf '\033[2m'); OFF=$(printf '\033[0m'); fi
@@ -46,8 +54,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
   cat >&2 <<EOF
-usage: setup-origin.sh <name> [options]
+usage: setup-origin.sh <name|--all> [options]
 
+  --all              re-issue every name this box already has a key for
+  --no-trust         do not trust the certificate on this machine
   --dry-run          write nothing, print what would happen
   --days <n>         certificate lifetime  (default: $DAYS)
   --webroot <dir>    site files            (default: /var/www/<name>)
@@ -68,10 +78,35 @@ EOF
 # dies telling you that `--help` is not a Moshpit name.
 case "$NAME" in -h|--help) usage; exit 0 ;; esac
 
+# `--all` re-issues every name this box already serves, which is what makes
+# repairing a fleet of CA:TRUE certificates one command rather than one command
+# per name — and the names are already on disk, so there is nothing to type and
+# nothing to get wrong. Every key is reused, so no pin moves and the registry
+# does not need to hear about any of this.
+#
+# Done by re-invoking rather than by looping the body: each name gets the same
+# validation, the same nginx reload and the same proof-of-serving it would get
+# on its own, instead of a second code path that drifts from the first.
+if [ "$NAME" = "--all" ]; then
+  shift
+  found=0
+  for _key in "$CERTDIR"/*.key; do
+    [ -f "$_key" ] || continue          # no match: the glob stayed literal
+    _name=$(basename "$_key" .key)
+    found=$((found + 1))
+    step "$_name"
+    sh "$0" "$_name" "$@" || die "$_name failed — stopping before the rest"
+  done
+  [ "$found" != "0" ] || die "no keys in $CERTDIR — nothing to re-issue (name a site instead of --all)"
+  exit 0
+fi
+
 shift 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --no-trust) TRUST_LOCAL=0 ;;
+    --all)     die "--all goes first: sh $0 --all [options]" ;;
     --days)    DAYS="${2:?--days needs a number}"; shift ;;
     --webroot) WEBROOT="${2:?--webroot needs a path}"; shift ;;
     --api-key) API_KEY="${2:?--api-key needs a token}"; shift ;;
@@ -87,6 +122,14 @@ done
 case "$NAME" in
   *.*) ;;
   *) die "'$NAME' does not look like a Moshpit name" ;;
+esac
+# The name becomes a path -- under $CERTDIR, under $SITEDIR, and (below) under
+# /usr/local/share/ca-certificates. A `/` or a `..` in it would write somewhere
+# nobody asked for, as root. Nothing legal is lost by refusing them: a hostname
+# is letters, digits, dots and dashes.
+case "$NAME" in
+  *[!a-zA-Z0-9.-]* | .* | *..*)
+    die "'$NAME' is not a hostname — letters, digits, dots and dashes only" ;;
 esac
 have openssl || die "openssl is required"
 
@@ -134,13 +177,31 @@ fi
 CRT="$CERTDIR/$NAME.crt"
 KEY="$CERTDIR/$NAME.key"
 
+# `openssl req -x509` defaults to basicConstraints=CA:TRUE, and that default is
+# actively harmful here. This certificate is meant to be trusted directly — it
+# is its own anchor, which is the whole point of a pinned self-signed origin —
+# and a trust anchor marked CA:TRUE may issue for *any* name. The SAN limits
+# what this certificate speaks for; it does not limit what a key trusted as a CA
+# can go on to sign. So a client that trusted a CA:TRUE origin certificate would
+# be handing that key authority over google.com, not over one Moshpit name.
+#
+# CA:FALSE plus a single-name SAN is the shape that makes direct trust a small,
+# bounded grant: it vouches for this name and can vouch for nothing else.
+# `moshcode dns trust` refuses the CA:TRUE shape for exactly this reason.
+LEAF_EXT='basicConstraints=critical,CA:FALSE'
+LEAF_USE='keyUsage=critical,digitalSignature,keyEncipherment'
+LEAF_EKU='extendedKeyUsage=serverAuth'
+
 if [ -f "$KEY" ]; then
   # Reusing the key is the point: the pin is over the key, so a certificate can
-  # be regenerated as often as you like and the published pin stays valid.
+  # be regenerated as often as you like and the published pin stays valid. It is
+  # also what makes fixing an already-issued CA:TRUE certificate free — re-run
+  # this and the pin the registry publishes does not move.
   say "  ${DIM}key already exists — reusing it so the published pin stays valid${OFF}"
   if [ "$DRY_RUN" = "0" ]; then
     openssl req -x509 -new -nodes -key "$KEY" -sha256 -days "$DAYS" \
-      -subj "/CN=$NAME" -addext "subjectAltName=DNS:$NAME" -out "$CRT"
+      -subj "/CN=$NAME" -addext "subjectAltName=DNS:$NAME" \
+      -addext "$LEAF_EXT" -addext "$LEAF_USE" -addext "$LEAF_EKU" -out "$CRT"
   fi
 else
   if [ "$DRY_RUN" = "0" ]; then
@@ -148,6 +209,7 @@ else
       -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
       -sha256 -days "$DAYS" \
       -subj "/CN=$NAME" -addext "subjectAltName=DNS:$NAME" \
+      -addext "$LEAF_EXT" -addext "$LEAF_USE" -addext "$LEAF_EKU" \
       -keyout "$KEY" -out "$CRT"
     chmod 600 "$KEY"
   fi
@@ -222,6 +284,59 @@ if [ "$DRY_RUN" = "0" ]; then
     *)         warn "after 5 tries the server still answers '$NAME' with: $presented"
                warn "another server block is matching first — check for a default_server" ;;
   esac
+fi
+
+# ------------------------------------------------------- trust it on this box
+
+# The machine that serves a Moshpit name is also, usually, a machine somebody
+# browses it from — and until now `curl https://<name>` on the origin itself
+# failed to verify, which reads as "this site is broken" rather than "no CA will
+# ever sign for this ending".
+#
+# The pinned-TLS proxy is the general answer to that, but it cannot be the
+# answer *here*: it works by owning port 443 on loopback, and on an origin nginx
+# already has 443. Two listeners cannot share it — a second bind gets EADDRINUSE
+# — so on this one class of machine the proxy can never be on the path.
+#
+# Trusting the certificate directly needs no port and no proxy, and CA:FALSE
+# above is what makes it a bounded grant: it vouches for this one name and can
+# vouch for nothing else. The file name matches what `moshcode dns trust`
+# writes, so the two agree instead of each leaving a copy the other ignores.
+if [ "$TRUST_LOCAL" = "1" ] && [ "$DRY_RUN" = "0" ]; then
+  step "trusting $NAME on this machine"
+
+  # Read back what is on disk rather than believing the variables above. This is
+  # the one step that installs a trust anchor, and a certificate that is not the
+  # bounded shape must not be installed merely because this run meant to write
+  # one. An older CA:TRUE certificate arriving here is precisely the case to
+  # refuse: trusted as an anchor, its key could vouch for any name at all.
+  if openssl x509 -in "$CRT" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:FALSE'; then
+    case "$(uname -s)" in
+      Darwin)
+        if security add-trusted-cert -d -r trustRoot \
+             -k /Library/Keychains/System.keychain "$CRT" 2>/dev/null; then
+          say "  ${DIM}trusted in the system keychain${OFF}"
+        else
+          warn "could not add $NAME to the system keychain"
+        fi ;;
+      *)
+        if have update-ca-certificates; then
+          if mkdir -p /usr/local/share/ca-certificates \
+             && cp "$CRT" "/usr/local/share/ca-certificates/moshpit-$NAME.crt" \
+             && update-ca-certificates >/dev/null 2>&1; then
+            say "  ${DIM}trusted in the system store — curl https://$NAME verifies here now${OFF}"
+          else
+            warn "could not install $NAME into the system trust store"
+          fi
+        else
+          warn "no update-ca-certificates here — skipping local trust for $NAME"
+        fi ;;
+    esac
+  else
+    warn "$CRT is not CA:FALSE, so it was not trusted on this machine."
+    warn "a certificate trusted as a CA can vouch for any name, not just $NAME."
+    warn "re-run this script to re-issue it — the key is reused, so the pin does not change."
+  fi
 fi
 
 # ------------------------------------------------------------------ the pin
