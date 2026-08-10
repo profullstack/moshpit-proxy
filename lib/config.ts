@@ -67,8 +67,11 @@ function loadOverrides(path: string): Record<string, string[]> {
 }
 
 function intOr(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  const text = value?.trim() ?? "";
+  if (!/^\d+$/.test(text)) return fallback;
+
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 65_535 ? parsed : fallback;
 }
 
 function truthy(value: string | undefined): boolean {
