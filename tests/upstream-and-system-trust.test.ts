@@ -9,6 +9,7 @@
 // 2. `moshpit-trust` covered browsers and not the system CA store, so `curl`
 //    still failed on a machine that had been "set up".
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createPinClient } from "../lib/pins.ts";
@@ -153,6 +154,26 @@ test("uninstalling removes the anchor and rebuilds, in that order", async () => 
   assert.equal(files.has(`/usr/local/share/ca-certificates/${ANCHOR_FILENAME}`), false);
   assert.ok(ran.includes("update-ca-certificates"),
     "an anchor removed without a rebuild leaves the bundle still trusting it");
+});
+
+test("uninstalling removes a stale anchor that never reached the bundle", async () => {
+  const { env, files, ran } = fakeLinux();
+  const anchor = join("/usr/local/share/ca-certificates", ANCHOR_FILENAME);
+  files.set("/usr/local/share/ca-certificates", "");
+  files.set(anchor, PEM);
+  files.set("/etc/ssl/certs/ca-certificates.crt", "unrelated content");
+
+  const store = discoverStores(env).find((s) => s.kind === "ca-certificates")!;
+  assert.equal((await status(store, env)).installed, false,
+    "precondition: the stale file is not active in the system bundle");
+
+  const result = await uninstall(store, env);
+
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.changed, true);
+  assert.equal(files.has(anchor), false,
+    "uninstall must remove a dormant anchor before a later bundle refresh can activate it");
+  assert.ok(ran.includes("update-ca-certificates"));
 });
 
 test("status is honest when the file is present but the bundle is not rebuilt", async () => {

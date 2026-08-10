@@ -380,7 +380,10 @@ export async function install(
 /** Remove the root from one store. Absent is success — this has to be re-runnable. */
 export async function uninstall(store: Store, env: TrustEnv = defaultEnv()): Promise<InstallResult> {
   const before = await status(store, env);
-  if (!before.installed) return { store, ok: true, changed: false, detail: "was not present" };
+  const hasSystemAnchor = store.kind === "ca-certificates" && env.exists(join(store.path, ANCHOR_FILENAME));
+  if (!before.installed && !hasSystemAnchor) {
+    return { store, ok: true, changed: false, detail: "was not present" };
+  }
 
   try {
     if (store.kind === "ca-certificates") {
