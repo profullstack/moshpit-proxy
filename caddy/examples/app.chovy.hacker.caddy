@@ -1,0 +1,21 @@
+# Example drop-in override: /etc/caddy/moshpit.d/app.chovy.hacker.caddy
+#
+# Any file matching /etc/caddy/moshpit.d/*.caddy is imported INTO the site
+# block in the template, so it must contain directives that are valid inside
+# a site block — not a site block of its own.
+#
+# This one routes app.chovy.hacker to port 3000 instead of the 8080 default.
+# `handle` blocks are ordered by matcher specificity, so this host match wins
+# over the template's catch-all no matter where the import lands.
+
+# @svc-app host app.chovy.hacker
+# handle @svc-app {
+# 	reverse_proxy localhost:3000
+# }
+#
+# Matcher names must be unique across the whole site block — the template
+# already uses `@app` for its example, so pick your own (e.g. `@svc-app`).
+# To override a different subdomain, copy the two lines above, uncomment,
+# and change the name and port. One pair per override. Then:
+#
+# 	sudo systemctl reload caddy      # or: caddy reload

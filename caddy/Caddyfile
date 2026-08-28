@@ -1,0 +1,68 @@
+# Caddy local-service template for Moshpit names
+# ----------------------------------------------
+#
+# Two different jobs, two different servers:
+#
+#   nginx (this repo, nginx/moshpit-gateway.conf)
+#     The SNI-passthrough gateway. It peeks the ClientHello and forwards the
+#     TCP stream untouched — it terminates nothing and holds no keys.
+#
+#   Caddy (this file)
+#     The local-service terminator, for names that point AT THIS MACHINE.
+#     A moshpit wildcard DNS record (`*.chovy.hacker`) lands every subdomain
+#     here, and Caddy serves TLS for each one and reverse-proxies to local
+#     ports. This is topology-A-for-localhost: Caddy is a designed-in
+#     terminator, which is fine because the "origin" is a process you own,
+#     on a loopback socket you own.
+#
+# `tls internal` is not a shortcut. Public CAs are banned from issuing for
+# non-IANA names (CA/Browser Forum Baseline Requirements — issuance stopped
+# Nov 2015, stragglers revoked by Oct 2016), so there is no public option to
+# choose. Caddy's internal CA is the same trade the proxy's local root makes:
+# a CA whose key never leaves this machine. Trust it in your browser once,
+# same as ~/.moshpit/ca/ca.crt.
+
+# ---------------------------------------------------------------------------
+# Reusable default: internal TLS + fall through to the default local service.
+# Import this from any hosted-suffix block.
+# ---------------------------------------------------------------------------
+(moshpit-default) {
+	tls internal
+
+	# Default: everything under the suffix goes to localhost:8080.
+	# Specific-subdomain overrides belong in `handle` blocks ABOVE this
+	# one (Caddy orders `handle` by matcher specificity, so a host match
+	# always wins over the catch-all) or in drop-ins under
+	# /etc/caddy/moshpit.d/ — see caddy/examples/.
+	handle {
+		reverse_proxy localhost:8080
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Hosted suffix: chovy.hacker
+#
+# To host another suffix, copy this block and replace every `chovy.hacker`
+# (three places: the wildcard, the apex, and any `host` matchers).
+# ---------------------------------------------------------------------------
+*.chovy.hacker, chovy.hacker {
+
+	# --- Per-subdomain override (example) -----------------------------------
+	# Route one name to a different port than the default. Duplicate this
+	# `handle` pair per override, or drop a file in /etc/caddy/moshpit.d/
+	# instead of editing this template.
+	@app host app.chovy.hacker
+	handle @app {
+		reverse_proxy localhost:3000
+	}
+	# ------------------------------------------------------------------------
+
+	# Local services drop their own overrides in /etc/caddy/moshpit.d/*.caddy
+	# (see caddy/examples/ in this repo). A glob that matches nothing is a
+	# no-op, so the directory may be empty.
+	import /etc/caddy/moshpit.d/*.caddy
+
+	# Default route (position doesn't matter — the host-matched handles
+	# above outrank it by specificity, but last is the readable place).
+	import moshpit-default
+}

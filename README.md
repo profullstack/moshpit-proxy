@@ -243,6 +243,35 @@ node scripts/gen-upstreams.ts   # writes the SNI->origin map, reloads nginx
 The map is regenerated on a timer rather than looked up per connection, so the
 registry is not on the path of every TCP handshake.
 
+## Caddy local-service template
+
+The gateway above is for reaching other people's names. `caddy/Caddyfile` is
+for the opposite case: services running on *this* machine that you want
+reachable under a suffix you own. A moshpit wildcard DNS record
+(`*.chovy.hacker`, set alongside your pin at
+[app.moshcode.sh/pit/dns](https://app.moshcode.sh/pit/dns)) points every
+subdomain at this machine's address; Caddy answers TLS for each of them and
+reverse-proxies to a local port. Every subdomain defaults to
+`localhost:8080`; individual names are overridden to other ports with a
+two-line `handle` block, either in the template or as a drop-in under
+`/etc/caddy/moshpit.d/`.
+
+The certificate comes from Caddy's internal CA, for the same reason the proxy
+mints its own root: the CA/Browser Forum ban leaves no public option, so the
+trust anchor is a key that never leaves the machine. Trust it in your browser
+once, exactly as with `~/.moshpit/ca/ca.crt`.
+
+```sh
+sudo cp caddy/Caddyfile /etc/caddy/Caddyfile   # or merge the block into yours
+sudo mkdir -p /etc/caddy/moshpit.d             # per-service overrides live here
+sudo systemctl reload caddy                    # or: caddy reload
+```
+
+To host another suffix, copy the site block and replace the name — the
+template marks the spots. To route one subdomain elsewhere, see
+`caddy/examples/app.chovy.hacker.caddy`. The nginx config is untouched by any
+of this: it terminates nothing and never sees these connections.
+
 ## Post-quantum status
 
 - **Key exchange** — `X25519MLKEM768`, free from OpenSSL 3.5+ and on by default
