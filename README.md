@@ -56,8 +56,10 @@ the result in the one language a browser accepts.
 npm start                      # or: node bin/moshpit-proxy.ts
 ```
 
-Pair it with [`moshpit-dns`](../moshpit-dns), which points `.moshpit` names at
-loopback.
+Pair it with the [Moshpit DNS bridge][moshpit-dns], which points `.moshpit`
+names at loopback. The deployed unit is `systemd/moshpit-dns.service` below.
+
+[moshpit-dns]: https://github.com/moshcoder/moshcoding/blob/master/scripts/moshpit-dns.ts
 
 | Variable | Default | |
 |---|---|---|
