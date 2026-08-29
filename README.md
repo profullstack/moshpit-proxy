@@ -243,6 +243,40 @@ node scripts/gen-upstreams.ts   # writes the SNI->origin map, reloads nginx
 The map is regenerated on a timer rather than looked up per connection, so the
 registry is not on the path of every TCP handshake.
 
+## Parking (a name that is claimed but points nowhere)
+
+`nginx/moshpit-parking.conf` — the block that answers for names with no origin.
+
+A claimed name with no target resolves to an address rather than NXDOMAIN,
+because it is a name waiting to be pointed somewhere rather than an error. That
+address has to answer, and until now it did not: it was the gateway host, which
+is a Railway deployment, and Railway routes by an explicit list of custom
+domains. A Moshpit ending can never be on that list, so the edge answered every
+parked name with its own 404 before the request reached any app of ours:
+
+```sh
+curl -L http://scrambled.eggs/      # 301 -> https, then Railway's "Not Found"
+```
+
+This block turns the `Host` back into a name and 302s to that name's page in the
+Pit. Install it on the box the resolver parks names at:
+
+```sh
+cp nginx/moshpit-parking.conf /etc/nginx/conf.d/
+nginx -t && systemctl reload nginx
+```
+
+and point the resolver's gateway at that box — `MOSHPIT_GATEWAY_HOST`, or
+`MOSHPIT_GATEWAY_A` / `MOSHPIT_GATEWAY_AAAA` to pin the addresses directly.
+
+It is a `default_server` on port 80, because there is no list of parked names to
+enumerate, and it stays on port 80 for the reason `moshpit-origin.conf` gives at
+length: a parked name has no key and no pin, so a redirect to HTTPS trades a
+working page for an unverifiable certificate. Ordinary clearnet domains that
+land here are sent to the Pit's front door rather than to a name page — real
+TLDs are claimed as endings too, and silently redirecting a domain that already
+works is indistinguishable from a hijack.
+
 ## Caddy local-service template
 
 The gateway above is for reaching other people's names. `caddy/Caddyfile` is
