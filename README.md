@@ -269,13 +269,22 @@ nginx -t && systemctl reload nginx
 and point the resolver's gateway at that box — `MOSHPIT_GATEWAY_HOST`, or
 `MOSHPIT_GATEWAY_A` / `MOSHPIT_GATEWAY_AAAA` to pin the addresses directly.
 
-It is a `default_server` on port 80, because there is no list of parked names to
-enumerate, and it stays on port 80 for the reason `moshpit-origin.conf` gives at
-length: a parked name has no key and no pin, so a redirect to HTTPS trades a
-working page for an unverifiable certificate. Ordinary clearnet domains that
-land here are sent to the Pit's front door rather than to a name page — real
-TLDs are claimed as endings too, and silently redirecting a domain that already
-works is indistinguishable from a hijack.
+It claims names with a regex `server_name` rather than being a `default_server`,
+because a box worth hosting parking on already has one — the userdir vhost, the
+ACME responder — and a second is `nginx -t` failing with "a duplicate default
+server", which blocks every later reload including certbot's. nginx tries a
+regex only after every exact and wildcard name and before the default server, so
+existing vhosts keep their own traffic and parking still catches what nothing
+else claimed.
+
+It stays on port 80 for the reason `moshpit-origin.conf` gives at length: a
+parked name has no key and no pin, so a redirect to HTTPS trades a working page
+for an unverifiable certificate. `/.well-known/acme-challenge/` is carved out to
+the usual webroot, since the same regex matches ordinary two-label domains and
+an http-01 challenge must not be redirected. Those clearnet domains are sent to
+the Pit's front door rather than to a name page — real TLDs are claimed as
+endings too, and silently redirecting a domain that already works is
+indistinguishable from a hijack.
 
 ## Caddy local-service template
 
