@@ -11,9 +11,14 @@ import { tempDir } from "./helpers.ts";
 const run = promisify(execFile);
 
 describe("local CA", () => {
-  test("root is constrained to the Moshpit namespace", async () => {
+  test("root is constrained by excluding the real internet, not by listing Moshpit", async () => {
     const dir = await tempDir();
-    const ca = createLocalCa({ dir, tlds: ["moshpit", "whatever"] });
+    // No `tlds`, deliberately: the root covers every Moshpit ending without
+    // being told what they are. Naming all 18224 would put ~214 KB of name
+    // constraints into a certificate sent on every handshake, and would be
+    // stale the next time the registry sold one — which is why a machine could
+    // reach `.2600` over HTTPS and not `.hacker`.
+    const ca = createLocalCa({ dir });
     await ca.ensure();
 
     const { stdout } = await run("openssl", ["x509", "-in", ca.rootCertPath(), "-text", "-noout"]);
@@ -22,10 +27,43 @@ describe("local CA", () => {
     // thing to ask of someone. If it silently stopped being emitted, the whole
     // security story would change and nothing else would fail.
     assert.match(stdout, /X509v3 Name Constraints: critical/);
-    assert.match(stdout, /DNS:\.moshpit/);
-    assert.match(stdout, /DNS:\.whatever/);
     assert.match(stdout, /Excluded/);
+    assert.match(stdout, /DNS:\.com/);
+    assert.match(stdout, /DNS:\.org/);
     assert.match(stdout, /CA:TRUE/);
+    // RFC 5280 §4.2.1.10 leaves a name type unrestricted when no permitted
+    // subtree names it, which is what makes every Moshpit ending work. A
+    // permitted subtree appearing here would silently re-narrow the root to
+    // whatever it named.
+    assert.doesNotMatch(stdout, /Permitted:/);
+  });
+
+  test("the constraint holds: Moshpit names verify, real domains do not", async () => {
+    // The assertions above read the certificate. This one asks openssl to
+    // *use* it, which is the only thing that proves the exclusion is load
+    // bearing rather than decorative — the previous version of this test
+    // grepped for text and would have passed on a root that verified anything.
+    const dir = await tempDir();
+    const ca = createLocalCa({ dir });
+    await ca.ensure();
+
+    const verify = async (name: string) => {
+      await ca.certFor(name);
+      const leaf = join(dir, "leaves", `${name}.crt`);
+      try {
+        await run("openssl", ["verify", "-CAfile", ca.rootCertPath(), leaf]);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    for (const moshpit of ["chovy.hacker", "alt.2600", "blue.eggs"]) {
+      assert.equal(await verify(moshpit), true, `${moshpit} must verify against the local root`);
+    }
+    for (const real of ["google.com", "www.moshcode.sh"]) {
+      assert.equal(await verify(real), false, `${real} must NOT verify — the root may not vouch for the real internet`);
+    }
   });
 
   test("the root cannot certify a name outside the namespace", async () => {

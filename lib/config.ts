@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 export type Config = {
   listenHost: string;
   listenPort: number;
+  httpPort: number;
   gatewayHost: string;
   gatewayPort: number;
   registryBase: string;
@@ -30,11 +31,26 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // is what moves it to 443, together with the resolver that points names
     // at loopback in the first place.
     listenPort: intOr(env.MOSHPIT_PROXY_PORT, 8443),
+    // Port 80, because proxy mode points names at loopback and a browser sent
+    // to a Moshpit name arrives at 80 or 443 — there is no third option, and
+    // leaving 80 alone handed every http:// Moshpit name to whatever web server
+    // the machine already ran. 0 disables it, for a host that needs its own 80.
+    httpPort: intOr(env.MOSHPIT_PROXY_HTTP_PORT, 80),
     gatewayHost: env.MOSHPIT_GATEWAY_HOST || "pit.moshcode.sh",
     gatewayPort: intOr(env.MOSHPIT_GATEWAY_PORT, 443),
     registryBase: env.MOSHPIT_REGISTRY_BASE || "https://pit.moshcode.sh",
     dir,
-    tlds: (env.MOSHPIT_PROXY_TLDS || "moshpit")
+    // Empty by default, and empty means *every* Moshpit ending.
+    //
+    // It used to default to `moshpit` alone, which is why a machine could reach
+    // `.2600` over HTTPS and not `.hacker`: each ending worked only if someone
+    // had thought to name it. There are 18224 of them and the list grows, so
+    // the namespace is now defined by exclusion — anything IANA does not
+    // delegate — and needs no configuration at all.
+    //
+    // Setting it still works, and narrows: a deployment that wants to serve one
+    // ending and refuse the rest says so and gets exactly that.
+    tlds: (env.MOSHPIT_PROXY_TLDS || "")
       .split(",").map((t) => t.trim().replace(/^\.+/, "").toLowerCase()).filter(Boolean),
     // Off unless asked for, and asked for loudly. TOFU turns the first
     // connection into an act of faith; it exists so a grid can come up before
