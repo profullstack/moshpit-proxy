@@ -31,6 +31,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
+import { IANA_TLDS } from "./iana-tlds.ts";
 
 const run = promisify(execFile);
 
@@ -48,8 +49,15 @@ export type LocalCa = {
 
 export function createLocalCa(options: {
   dir: string;
-  /** The namespaces this root is permitted to certify. Everything else is excluded. */
-  tlds: string[];
+  /**
+   * Kept for callers that still pass it, and deliberately ignored.
+   *
+   * The root is no longer scoped by a list of endings to permit — it excludes
+   * the real internet instead, which covers every Moshpit ending without being
+   * told what they are. Removing the option outright would break every caller
+   * for no gain; honouring it would reintroduce the list that could not scale.
+   */
+  tlds?: string[];
   /** Leaf lifetime. Short because renewal is free and local. */
   leafDays?: number;
   rootDays?: number;
@@ -59,7 +67,6 @@ export function createLocalCa(options: {
   const leafDays = options.leafDays ?? 90;
   const rootDays = options.rootDays ?? 3650;
   const openssl = options.opensslPath ?? "openssl";
-  const tlds = options.tlds.map((t) => t.replace(/^\.+/, "").toLowerCase()).filter(Boolean);
 
   const caKey = join(dir, "ca.key");
   const caCrt = join(dir, "ca.crt");
@@ -85,7 +92,7 @@ export function createLocalCa(options: {
 
     if (!existsSync(caCrt) || !existsSync(caKey)) {
       const cnf = join(dir, "ca.cnf");
-      await writeFile(cnf, rootConfig(tlds), { mode: 0o600 });
+      await writeFile(cnf, rootConfig(), { mode: 0o600 });
       await openssl_([
         "req", "-x509", "-new", "-nodes",
         "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
@@ -194,8 +201,32 @@ export function createLocalCa(options: {
  * are excluded explicitly. Without those a permitted-DNS-only root is still
  * able to certify, say, an IP address, which defeats the point.
  */
-function rootConfig(tlds: string[]): string {
-  const permitted = tlds.map((tld, i) => `permitted;DNS.${i} = .${tld}`).join("\n");
+/**
+ * The root, constrained by exclusion rather than by a list of what to permit.
+ *
+ * Naming every ending it may certify does not scale. There are 18224 of them,
+ * a permitted subtree for each puts roughly 214 KB of name constraints into a
+ * certificate that is sent on every handshake, and the list is stale the moment
+ * the registry sells another one — which is why a machine could reach `.2600`
+ * over HTTPS and not `.hacker`, depending on which endings someone had thought
+ * to configure.
+ *
+ * Excluding the 1438 real top-level domains instead costs about 15 KB, needs no
+ * configuration, and covers every ending Moshpit will ever sell, including the
+ * ones sold after this root was minted.
+ *
+ * The property worth having survives the inversion. A root permitting `.hacker`
+ * cannot vouch for `google.com`; neither can a root excluding every delegated
+ * TLD. What changes is only that the second does not have to be told what
+ * Moshpit sells. RFC 5280 §4.2.1.10 leaves a name type unrestricted when no
+ * permitted subtree names it, so DNS names outside the excluded set are
+ * allowed — that is the intent here, and it is why the excluded set has to be
+ * the whole of IANA rather than a sample of it.
+ */
+function rootConfig(): string {
+  const excluded = [...IANA_TLDS]
+    .map((tld, i) => `excluded;DNS.${i} = .${tld}`)
+    .join("\n");
   return `[ req ]
 distinguished_name = dn
 x509_extensions    = v3_ca
@@ -212,12 +243,11 @@ subjectKeyIdentifier = hash
 nameConstraints      = critical, @nc
 
 [ nc ]
-${permitted}
+${excluded}
 excluded;IP.0    = 0.0.0.0/0.0.0.0
 excluded;IP.1    = ::/::
 excluded;email.0 = .
 excluded;URI.0   = .
-excluded;DNS.0   = .invalid
 `;
 }
 

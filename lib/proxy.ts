@@ -37,6 +37,7 @@ import type { LocalCa } from "./ca.ts";
 import type { PinClient } from "./pins.ts";
 import { pinFromPeer, pinMatches } from "./spki.ts";
 import { describeKeyExchange } from "./pq.ts";
+import { endingOf, isRealTld } from "./iana-tlds.ts";
 
 export type ProxyStats = {
   accepted: number;
@@ -59,6 +60,34 @@ export type Proxy = {
   stats(): ProxyStats;
   port(): number;
 };
+
+/**
+ * Is this a name the proxy serves?
+ *
+ * The namespace is everything IANA does not delegate. That needs no list of
+ * what Moshpit has sold, does not go stale when it sells more, and matches the
+ * local root's own constraint, which excludes the real TLDs rather than
+ * permitting 18224 Moshpit ones — the two have to agree or the proxy offers
+ * certificates the root refuses to back.
+ *
+ * An explicit list still narrows it, for a deployment that wants to serve part
+ * of the namespace and refuse the rest. Empty means all of it, which is the
+ * default and the reason no configuration is needed.
+ *
+ * Exported because both listeners need the same answer: 443 decides what to
+ * terminate TLS for, 80 decides what to forward.
+ */
+export function namespaceTest(tlds: string[]): (name: string) => boolean {
+  const suffixes = tlds.map((t) => `.${t.replace(/^\.+/, "").toLowerCase()}`);
+  return (name: string) => {
+    const clean = String(name ?? "").trim().toLowerCase().replace(/\.$/, "");
+    if (suffixes.length) return suffixes.some((suffix) => clean.endsWith(suffix));
+    const ending = endingOf(clean);
+    // A bare label has no ending to judge and is never a Moshpit name; a real
+    // TLD is somebody else's, and the root would refuse to be trusted for it.
+    return ending !== "" && !isRealTld(ending);
+  };
+}
 
 export function createProxy(options: {
   pins: PinClient;
@@ -92,7 +121,6 @@ export function createProxy(options: {
   const tofu = options.tofu ?? false;
   const requirePq = options.requirePq ?? false;
   const log = options.log ?? (() => {});
-  const suffixes = options.tlds.map((t) => `.${t.replace(/^\.+/, "").toLowerCase()}`);
 
   const stats: ProxyStats = {
     accepted: 0, verified: 0,
@@ -100,9 +128,7 @@ export function createProxy(options: {
     pqSessions: 0, classicalSessions: 0, upstreamErrors: 0,
   };
 
-  function inNamespace(name: string): boolean {
-    return suffixes.some((suffix) => name.endsWith(suffix));
-  }
+  const inNamespace = namespaceTest(options.tlds ?? []);
 
   const server: Server = createServer({
     // Only http/1.1 is offered; see the note at the top of the file.
