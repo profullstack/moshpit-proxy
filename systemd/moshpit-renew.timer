@@ -1,0 +1,16 @@
+[Unit]
+Description=Renew registry-signed Moshpit certificates daily
+Documentation=https://github.com/profullstack/moshpit-proxy
+
+[Timer]
+# Daily is plenty: renewal starts ten days before expiry, so there are ten
+# chances before a missed one costs anything.
+OnBootSec=5min
+OnUnitActiveSec=1d
+# Spread across boxes so the registry is not asked by every origin at once.
+RandomizedDelaySec=1h
+# A box that was off must still catch up rather than wait a full day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
