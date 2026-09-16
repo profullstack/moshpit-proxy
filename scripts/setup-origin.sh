@@ -15,20 +15,21 @@
 #
 #   sudo sh scripts/setup-origin.sh --all      # every name this box serves
 #
-# Self-signed is the design, not a shortcut. No CA will issue for a Moshpit TLD,
-# so identity comes from the registry publishing SHA-256(SubjectPublicKeyInfo)
-# for the name and clients checking the key they were handed against it. Which
-# means the last step is not optional: until the pin is published, every client
-# refuses the name rather than trusting it on sight.
-#
-# With MOSHPIT_API_KEY set, that last step stops being manual:
+# The registry signs. pit.moshcode.sh runs a certificate authority for the
+# names it holds (moshcode apps/pwa/docs/moshpit-ca.md): with MOSHPIT_API_KEY
+# set this sends it a CSR for the name and serves the chain it returns, so any
+# client that trusts the pit's root -- TronBrowser, a box that ran `moshcode dns
+# enable` -- accepts the name with no pin lookup and no per-name import. The
+# leaf lasts 30 days; a timer this script installs renews it. The pin is still
+# published (the key is the same), so clients that check pins keep working.
 #
 #   MOSHPIT_API_KEY=... sh setup-origin.sh chovy.hacker --target dev.profullstack.com
 #
-# publishes the pin and sets the target over the registry API, so the whole of
-# "serve this name" is one command. Get a key at app.moshcode.sh/settings.
-# Without the key nothing changes -- it prints the pin and tells you where to
-# paste it, exactly as before.
+# Without a key, or with --self-signed, the certificate is self-signed as it
+# always was: identity then comes from the registry publishing
+# SHA-256(SubjectPublicKeyInfo) and clients checking the key against it, and
+# the script prints the pin and where to paste it. Get a key at
+# app.moshcode.sh/settings.
 set -eu
 
 NAME="${1:-}"
@@ -40,6 +41,8 @@ DAYS="${MOSHPIT_DAYS:-825}"
 TEMPLATE="${MOSHPIT_TEMPLATE:-$(dirname "$0")/../nginx/moshpit-origin.conf}"
 API_KEY="${MOSHPIT_API_KEY:-}"
 REGISTRY="${MOSHPIT_REGISTRY:-https://app.moshcode.sh}"
+SELF_SIGNED="${MOSHPIT_SELF_SIGNED:-0}"
+RENEW_ENV="${MOSHPIT_RENEW_ENV:-/etc/moshpit/renew.env}"
 TARGET=""
 DRY_RUN=0
 TRUST_LOCAL=1
@@ -58,6 +61,7 @@ usage: setup-origin.sh <name|--all> [options]
 
   --all              re-issue every name this box already has a key for
   --no-trust         do not trust the certificate on this machine
+  --self-signed      keep the self-signed certificate; do not ask the registry to sign
   --dry-run          write nothing, print what would happen
   --days <n>         certificate lifetime  (default: $DAYS)
   --webroot <dir>    site files            (default: /var/www/<name>)
@@ -70,7 +74,7 @@ IPv6 address or a hostname. A hostname is how a name reaches IPv4 clients,
 since the address behind it is resolved normally.
 
 environment: MOSHPIT_CERTDIR, MOSHPIT_SITEDIR, MOSHPIT_ENABLEDIR, MOSHPIT_WEBROOT,
-             MOSHPIT_API_KEY, MOSHPIT_REGISTRY
+             MOSHPIT_API_KEY, MOSHPIT_REGISTRY, MOSHPIT_SELF_SIGNED, MOSHPIT_RENEW_ENV
 EOF
 }
 
@@ -106,6 +110,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --no-trust) TRUST_LOCAL=0 ;;
+    --self-signed) SELF_SIGNED=1 ;;
     --all)     die "--all goes first: sh $0 --all [options]" ;;
     --days)    DAYS="${2:?--days needs a number}"; shift ;;
     --webroot) WEBROOT="${2:?--webroot needs a path}"; shift ;;
@@ -215,6 +220,66 @@ else
   fi
 fi
 
+# ------------------------------------------------ a certificate from the pit
+
+# The self-signed certificate above is the fallback; this replaces it with one
+# the registry signed, when there is a key to ask with and the registry has a
+# CA. Same key, so the pin does not move. The chain (leaf, issuer, root) is
+# written over $CRT: nginx's ssl_certificate takes a chain file, and serving
+# the intermediate is what lets a client that holds only the root verify.
+SIGNED=0
+if [ "$SELF_SIGNED" = "0" ] && [ -n "$API_KEY" ]; then
+  step "asking the registry to sign $NAME"
+  _tld="${NAME#*.}"
+  _label="${NAME%%.*}"
+  if [ "$DRY_RUN" = "1" ]; then
+    say "  ${DIM}(dry run) would POST a CSR to $REGISTRY/api/moshpit/tlds/$_tld/certs and serve the chain it returns${OFF}"
+  elif ! have curl; then
+    warn "curl is required to ask the registry for a certificate — keeping the self-signed one"
+  else
+    _ca=$(curl -sS --max-time 10 "$REGISTRY/api/moshpit/ca" 2>/dev/null || true)
+    case "$_ca" in
+      *'"enabled":true'*)
+        # One line per PEM line, escaped for JSON by hand: the CSR is base64
+        # and dashes, nothing else, so a newline is the only character at issue.
+        _csr=$(openssl req -new -key "$KEY" -subj "/CN=$NAME" 2>/dev/null | awk '{printf "%s\\n", $0}')
+        _resp=$(curl -sS --max-time 30 -X POST "$REGISTRY/api/moshpit/tlds/$_tld/certs" \
+          -H "authorization: Bearer $API_KEY" -H "content-type: application/json" \
+          -d "{\"label\":\"$_label\",\"csr\":\"$_csr\"}" -w '\n%{http_code}' 2>&1 || true)
+        _code=$(printf '%s' "$_resp" | tail -n1)
+        _body=$(printf '%s' "$_resp" | sed '$d')
+        case "$_code" in
+          201)
+            printf '%s' "$_body" | sed -n 's/.*"chain":"\([^"]*\)".*/\1/p' | sed 's/\\n/\
+/g' > "$CRT.new"
+            if [ "$(grep -c 'BEGIN CERTIFICATE' "$CRT.new" 2>/dev/null)" -ge 2 ] \
+               && openssl x509 -in "$CRT.new" -noout -checkhost "$NAME" 2>/dev/null | grep -q 'match'; then
+              mv "$CRT.new" "$CRT"
+              chmod 644 "$CRT"
+              SIGNED=1
+              _until=$(openssl x509 -in "$CRT" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+              say "  ${DIM}signed by the pit — serving the chain from $CRT, until $_until${OFF}"
+              printf '%s' "$_body" | sed -n 's/.*"root":"\([^"]*\)".*/\1/p' | sed 's/\\n/\
+/g' > "$CERTDIR/moshpit-root-ca.crt"
+              # What the renewal timer needs, root-only, never in the site dir.
+              mkdir -p "$(dirname "$RENEW_ENV")"
+              ( umask 077; printf 'MOSHPIT_API_KEY=%s\nMOSHPIT_REGISTRY=%s\nMOSHPIT_CERTDIR=%s\n' "$API_KEY" "$REGISTRY" "$CERTDIR" > "$RENEW_ENV" )
+            else
+              rm -f "$CRT.new"
+              warn "the registry's answer did not parse as a chain for $NAME — keeping the self-signed certificate"
+            fi ;;
+          503)
+            say "  ${DIM}the registry has no CA configured — keeping the self-signed certificate${OFF}" ;;
+          *)
+            warn "the registry refused to sign $NAME ($_code): $_body"
+            warn "keeping the self-signed certificate; the pin below still covers it" ;;
+        esac ;;
+      *)
+        say "  ${DIM}the registry publishes no CA yet — keeping the self-signed certificate${OFF}" ;;
+    esac
+  fi
+fi
+
 # ------------------------------------------------------------------ nginx
 
 step "writing the nginx server block"
@@ -310,7 +375,30 @@ if [ "$TRUST_LOCAL" = "1" ] && [ "$DRY_RUN" = "0" ]; then
   # bounded shape must not be installed merely because this run meant to write
   # one. An older CA:TRUE certificate arriving here is precisely the case to
   # refuse: trusted as an anchor, its key could vouch for any name at all.
-  if openssl x509 -in "$CRT" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:FALSE'; then
+  if [ "$SIGNED" = "1" ]; then
+    # Signed by the pit: the thing to trust here is its root, once, the same
+    # file and name `moshcode dns enable` installs. The leaf is ordinary.
+    case "$(uname -s)" in
+      Darwin)
+        if security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERTDIR/moshpit-root-ca.crt" 2>/dev/null; then
+          say "  ${DIM}Moshpit Root CA trusted in the system keychain${OFF}"
+        else
+          warn "could not add the Moshpit Root CA to the system keychain"
+        fi ;;
+      *)
+        if have update-ca-certificates; then
+          if mkdir -p /usr/local/share/ca-certificates \
+             && cp "$CERTDIR/moshpit-root-ca.crt" /usr/local/share/ca-certificates/moshpit-root-ca.crt \
+             && update-ca-certificates >/dev/null 2>&1; then
+            say "  ${DIM}Moshpit Root CA trusted in the system store — curl https://$NAME verifies here now${OFF}"
+          else
+            warn "could not install the Moshpit Root CA into the system trust store"
+          fi
+        else
+          warn "no update-ca-certificates here — skipping local trust"
+        fi ;;
+    esac
+  elif openssl x509 -in "$CRT" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:FALSE'; then
     case "$(uname -s)" in
       Darwin)
         if security add-trusted-cert -d -r trustRoot \
@@ -336,6 +424,25 @@ if [ "$TRUST_LOCAL" = "1" ] && [ "$DRY_RUN" = "0" ]; then
     warn "$CRT is not CA:FALSE, so it was not trusted on this machine."
     warn "a certificate trusted as a CA can vouch for any name, not just $NAME."
     warn "re-run this script to re-issue it — the key is reused, so the pin does not change."
+  fi
+fi
+
+# ------------------------------------------------------------- renewal
+
+# A 30-day leaf without a renewal is an outage with a date on it. The timer
+# runs moshpit-renew.sh daily, which re-runs this script for any registry-signed
+# name within ten days of expiry. Installed here, by the run that made the
+# first signed certificate, rather than left as a step for someone to remember.
+if [ "$SIGNED" = "1" ] && [ "$DRY_RUN" = "0" ] && have systemctl; then
+  _units="$(dirname "$0")/../systemd"
+  if [ -f "$_units/moshpit-renew.timer" ] && [ ! -f /etc/systemd/system/moshpit-renew.timer ]; then
+    step "installing the renewal timer"
+    if cp "$_units/moshpit-renew.service" "$_units/moshpit-renew.timer" /etc/systemd/system/ 2>/dev/null \
+       && systemctl daemon-reload 2>/dev/null && systemctl enable --now moshpit-renew.timer >/dev/null 2>&1; then
+      say "  ${DIM}moshpit-renew.timer — daily; renews within ten days of expiry${OFF}"
+    else
+      warn "could not enable moshpit-renew.timer — the certificate for $NAME expires in 30 days unless this is re-run"
+    fi
   fi
 fi
 

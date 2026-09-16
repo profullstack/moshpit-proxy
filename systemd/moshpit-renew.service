@@ -1,0 +1,16 @@
+[Unit]
+# A 30-day certificate without a renewal is an outage with a date on it. The
+# registry signs short leaves on purpose (no revocation to run); this is the
+# other half of that bargain, and setup-origin.sh installs it the first time
+# it gets a registry-signed certificate, so nobody has to remember to.
+Description=Renew registry-signed Moshpit certificates on this box
+Documentation=https://github.com/profullstack/moshpit-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/moshpit/scripts/moshpit-renew.sh
+# A failed renewal leaves the old certificate in place; the next daily run
+# tries again, and there are ten days of them before it matters.
+Restart=no
