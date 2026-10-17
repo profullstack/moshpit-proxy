@@ -92,3 +92,17 @@ describe("moshpit-renew.sh", () => {
     assert.match(r.stdout, /1 renewed, 0 failed/);
   });
 });
+
+describe("setup-origin.sh — a name's own server block", () => {
+  test("a template named for the site is used, so a renewal keeps its proxy", async () => {
+    const dir = await tempDir();
+    const templates = join(dir, "templates");
+    await mkdir(templates, { recursive: true });
+    await writeFile(join(templates, "live.streaming.conf"), "server { server_name NAME; }\n");
+    const own = await sh(setup, ["live.streaming", "--dry-run"], { MOSHPIT_TEMPLATE_DIR: templates, MOSHPIT_TEMPLATE: "" });
+    assert.equal(own.code, 0, own.stderr);
+    assert.match(own.stderr + own.stdout, new RegExp(`server block from ${join(templates, "live.streaming.conf").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    const other = await sh(setup, ["blue.eggs", "--dry-run"], { MOSHPIT_TEMPLATE_DIR: templates, MOSHPIT_TEMPLATE: "" });
+    assert.match(other.stderr + other.stdout, /server block from .*moshpit-origin\.conf/);
+  });
+});
