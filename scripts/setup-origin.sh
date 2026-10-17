@@ -282,7 +282,16 @@ fi
 
 # ------------------------------------------------------------------ nginx
 
-step "writing the nginx server block"
+# A name can bring its own server block: /etc/moshpit/templates/<name>.conf
+# (MOSHPIT_TEMPLATE_DIR). Without it, a name whose site is a proxy to an app
+# (seo.rank, live.streaming) was rewritten back to the static webroot by the
+# next renewal, which re-runs this script. MOSHPIT_TEMPLATE, when set, still
+# wins, for a box whose every name is served the same way.
+NAME_TEMPLATE="${MOSHPIT_TEMPLATE_DIR:-/etc/moshpit/templates}/$NAME.conf"
+if [ -z "${MOSHPIT_TEMPLATE:-}" ] && [ -f "$NAME_TEMPLATE" ]; then
+  TEMPLATE="$NAME_TEMPLATE"
+fi
+step "writing the nginx server block from $TEMPLATE"
 CONF="$SITEDIR/$NAME"
 if [ "$DRY_RUN" = "0" ]; then
   mkdir -p "$SITEDIR" "$ENABLEDIR" "$WEBROOT"
