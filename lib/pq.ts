@@ -34,6 +34,15 @@
 // against real loopback handshakes at startup, and the caller refuses to
 // enforce anything if the proof fails.
 //
+// ## Builds that name the hybrid
+//
+// That future arrived: Node 24.21 on OpenSSL 3.5.8 reports
+// `{ type: "...", name: "X25519MLKEM768", ... }` for a hybrid session. So a
+// name alone no longer means classical — it means "look at the name". A group
+// whose name carries ML-KEM (or the pre-standard Kyber) is post-quantum; any
+// other name is classical; `{}` is still read as the hybrid for the builds that
+// cannot represent it. `probeDetector()` still proves both halves either way.
+//
 // TLS 1.3 has no static key exchange — every handshake is (EC)DHE or a PSK — so
 // an empty result cannot mean "not ephemeral" here the way it could under 1.2.
 // The proxy never passes a `session`, so there is no PSK resumption path to
@@ -58,7 +67,7 @@ const CLASSICAL_GROUP = "x25519";
 export type KeyExchange = {
   /** True when the key exchange was a post-quantum hybrid. */
   postQuantum: boolean;
-  /** The named group, when Node can name it. Null for a hybrid, by construction. */
+  /** The named group, when Node can name it. Null for a hybrid on builds that cannot. */
   group: string | null;
   /** The negotiated protocol, carried through for logs. */
   protocol: string | null;
@@ -90,11 +99,17 @@ export function describeKeyExchange(socket: TLSSocket): KeyExchange {
 
   const name = (info as { name?: string }).name;
   if (typeof name === "string" && name.length > 0) {
-    return { postQuantum: false, group: name, protocol };
+    // Newer builds name the hybrid outright; see "Builds that name the hybrid".
+    return { postQuantum: isPqGroupName(name), group: name, protocol };
   }
 
   // Empty object on a TLS 1.3 client socket — the hybrid case. See the header.
   return { postQuantum: true, group: null, protocol };
+}
+
+/** ML-KEM groups, pure or hybrid, by the names OpenSSL gives them. */
+function isPqGroupName(name: string): boolean {
+  return /MLKEM|Kyber/i.test(name);
 }
 
 export type DetectorProbe = {
