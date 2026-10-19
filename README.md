@@ -202,6 +202,21 @@ resolved normally, which is also how a name reaches IPv4-only clients.
 Nothing is proxied on the server side. `moshpit-proxy` runs on the *visitor's*
 machine — it is the thing that checks the pin on behalf of a browser that cannot.
 
+### Hosting names for other people (a Moshpit server)
+
+`scripts/moshpit-host.sh` is the one-time setup for a customer's name on a shared box:
+their account (key-only), `~/apps/<name>/public`, and `setup-origin.sh` with that
+folder as the webroot and this box as the target, signed with the box's key in
+`/etc/moshpit/renew.env` (so the name must be held by that key's account).
+
+```sh
+sudo sh scripts/moshpit-host.sh alice shop.alice --key "ssh-ed25519 AAAA... alice@laptop"
+```
+
+From then on the customer deploys from their own machine with
+`moshcode deploy shop.alice --user alice`, which rsyncs the site into that folder and
+runs its `deploy.sh`, if any, inside the box's `deploy-gate`.
+
 ## Publishing a pin (site operators)
 
 ```sh
