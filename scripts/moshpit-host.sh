@@ -110,8 +110,10 @@ install -d -o "$USER_NAME" -g "$USER_NAME" "$HOME_DIR/apps" "$SITE" "$SITE/publi
 
 sh "$SETUP" "$NAME" --webroot "$SITE/public" --api-key "$MOSHPIT_API_KEY" --target "$TARGET"
 
-# setup-origin.sh writes a placeholder index.html as root; the folder is the customer's.
+# setup-origin.sh writes a placeholder index.html as root (and root's umask may be 027); the folder
+# is the customer's, and nginx reads it as another user.
 chown -R "$USER_NAME:$USER_NAME" "$SITE"
+chmod -R u+rwX,go+rX "$SITE/public"
 
 cat <<EOF
 
