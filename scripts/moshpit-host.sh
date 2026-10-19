@@ -3,6 +3,8 @@
 #
 #   sudo sh scripts/moshpit-host.sh alice shop.alice --key "ssh-ed25519 AAAA... alice@laptop"
 #
+# A name that does not exist yet is registered first, under an ending the box key holds.
+#
 # This is the one-time half of a Moshpit server ($5 a month, unlimited sites). It
 # makes the Unix account if it is new (key-only, password locked), adds the SSH key,
 # creates ~/apps/<name>/public, and runs setup-origin.sh for the name with that
@@ -73,6 +75,20 @@ fi
 # shellcheck disable=SC1090
 . "$RENEW_ENV"
 [ -n "${MOSHPIT_API_KEY:-}" ] || die "$RENEW_ENV has no MOSHPIT_API_KEY"
+REGISTRY="${MOSHPIT_REGISTRY:-https://app.moshcode.sh}"
+
+# Register the name first if it is new: the registry signs, points and pins only names that
+# exist. 201 is made, 409 is taken (by this account, fine: setup-origin's retarget proves it;
+# by anyone else, that call fails loudly), anything else stops here.
+TLD="${NAME##*.}"; LABEL="${NAME%.*}"
+status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$REGISTRY/api/moshpit/tlds/$TLD/names" \
+  -H "authorization: Bearer $MOSHPIT_API_KEY" -H 'content-type: application/json' \
+  --data "{\"label\":\"$LABEL\",\"target\":\"$TARGET\"}") || die "the registry did not answer"
+case "$status" in
+  201) echo "registered $NAME" ;;
+  409) ;;
+  *) die "could not register $NAME (HTTP $status): this box's key must hold .$TLD" ;;
+esac
 
 if ! id -u "$USER_NAME" >/dev/null 2>&1; then
   useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$USER_NAME"
