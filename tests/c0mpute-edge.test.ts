@@ -19,6 +19,9 @@ import {
   GatewayPool,
   SiteLookup,
   createEdgeHandler,
+  fibonacciDelay,
+  fibonacciDelays,
+  LastGood,
   gatewaysFromNodes,
   normalizeGateway,
   normalizeHost,
@@ -394,14 +397,16 @@ test("https://<name> is served from a healthy gateway with a registry-signed lea
   });
 });
 
-test("plain http serves the same sites, GET and HEAD only, 502 when no gateway answers", async (t) => {
+test("plain http serves the same sites, GET and HEAD only, stale then 503 when no gateway answers", async (t) => {
   const sites = { site: async (name: string) => (name === "blue.eggs" ? SITE : null) };
   let failures = 0;
   const gateways = { pick: () => ["http://g1:7777", "http://g2:7777"], succeeded: () => {}, failed: () => { failures++; } };
   let up = true;
+  const slept: number[] = [];
   const handler = createEdgeHandler({
     sites,
     gateways,
+    sleep: async (ms) => { slept.push(ms); },
     fetchImpl: (async (input: string | URL | Request) => {
       if (!up) throw new Error("ECONNREFUSED");
       if (String(input).startsWith("http://g1")) return new Response("bad", { status: 502 });
@@ -411,9 +416,9 @@ test("plain http serves the same sites, GET and HEAD only, 502 when no gateway a
   const srv = await listen((req, res) => { void handler(req, res); });
   t.after(() => srv.server.close());
   const port = Number(new URL(srv.url).port);
-  const call = (method: string, host: string) => new Promise<{ status: number; text: string }>((resolve, reject) => {
-    const req = httpRequest({ host: "127.0.0.1", port, method, path: "/", headers: { host } }, (res) => {
-      let text = ""; res.on("data", (d) => { text += d; }); res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+  const call = (method: string, host: string, path = "/") => new Promise<{ status: number; text: string; stale?: string }>((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, method, path, headers: { host } }, (res) => {
+      let text = ""; res.on("data", (d) => { text += d; }); res.on("end", () => resolve({ status: res.statusCode ?? 0, text, ...(res.headers["x-c0mpute-stale"] ? { stale: String(res.headers["x-c0mpute-stale"]) } : {}) }));
     });
     req.on("error", reject); req.end();
   });
@@ -425,5 +430,47 @@ test("plain http serves the same sites, GET and HEAD only, 502 when no gateway a
   assert.equal((await call("GET", "red.eggs")).status, 421, "not a c0mpute name: misdirected, not a missing page");
   assert.equal((await call("GET", "127.0.0.1")).status, 400);
   up = false;
-  assert.equal((await call("GET", "blue.eggs")).status, 502);
+  assert.deepEqual(await call("GET", "blue.eggs"), { status: 200, text: "hello", stale: "1" }, "the last good copy, marked stale");
+  assert.deepEqual(slept, [500, 500, 1000, 1500], "retried on a Fibonacci schedule first");
+  const miss = await call("GET", "blue.eggs", "/never-seen");
+  assert.equal(miss.status, 503, "nothing kept: a graceful 503, not a bare 502");
+  assert.match(miss.text, /back in a moment/);
+});
+
+test("a gateway that comes back mid-retry serves the request", async () => {
+  let calls = 0;
+  const handler = createEdgeHandler({
+    sites: { site: async () => SITE },
+    gateways: { pick: () => ["http://g1:7777"], succeeded: () => {}, failed: () => {} },
+    sleep: async () => {},
+    fetchImpl: (async () => {
+      calls++;
+      if (calls < 3) throw new Error("ECONNREFUSED");
+      return new Response("back", { status: 200 });
+    }) as typeof fetch,
+  });
+  const srv = await listen((req, res) => { void handler(req, res); });
+  const port = Number(new URL(srv.url).port);
+  const status = await new Promise<number>((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, path: "/", headers: { host: "blue.eggs" } }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode ?? 0)); });
+    req.on("error", reject); req.end();
+  });
+  srv.server.close();
+  assert.equal(status, 200);
+  assert.equal(calls, 3);
+});
+
+test("fibonacci delays and the LRU of last good pages", () => {
+  assert.deepEqual(fibonacciDelays(7, 100), [100, 100, 200, 300, 500, 800, 1300]);
+  assert.deepEqual(fibonacciDelays(4, 5000, 9000), [5000, 5000, 9000, 9000]);
+  assert.equal(fibonacciDelay(5, 5000, 300_000), 25_000);
+  const lg = new LastGood({ maxEntryBytes: 4, maxBytes: 6 });
+  lg.put("a", 200, {}, Buffer.from("aaa"));
+  lg.put("b", 200, {}, Buffer.from("bbb"));
+  lg.put("big", 200, {}, Buffer.from("too big"));
+  assert.equal(lg.get("big"), null, "over the per-page cap: not kept");
+  lg.get("a");
+  lg.put("c", 200, {}, Buffer.from("ccc"));
+  assert.equal(lg.get("b"), null, "least recently used went first");
+  assert.ok(lg.get("a") && lg.get("c"));
 });
