@@ -10,7 +10,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -431,7 +431,7 @@ test("plain http serves the same sites, GET and HEAD only, stale then 503 when n
   assert.equal((await call("GET", "127.0.0.1")).status, 400);
   up = false;
   assert.deepEqual(await call("GET", "blue.eggs"), { status: 200, text: "hello", stale: "1" }, "the last good copy, marked stale");
-  assert.deepEqual(slept, [500, 500, 1000, 1500], "retried on a Fibonacci schedule first");
+  assert.deepEqual(slept, [500, 500, 1000, 1500, 2500, 4000], "retried on a Fibonacci schedule first");
   const miss = await call("GET", "blue.eggs", "/never-seen");
   assert.equal(miss.status, 503, "nothing kept: a graceful 503, not a bare 502");
   assert.match(miss.text, /back in a moment/);
@@ -473,4 +473,19 @@ test("fibonacci delays and the LRU of last good pages", () => {
   lg.put("c", 200, {}, Buffer.from("ccc"));
   assert.equal(lg.get("b"), null, "least recently used went first");
   assert.ok(lg.get("a") && lg.get("c"));
+});
+
+test("last good copies outlive a restart when kept on disk", async (t) => {
+  const dir = await tempDir("moshpit-edge-stale-");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const a = new LastGood({ dir });
+  await a.load();
+  a.put("site/x", 200, { "content-type": "text/html" }, Buffer.from("<p>kept</p>"));
+  await new Promise((r) => setTimeout(r, 50));
+  const b = new LastGood({ dir });
+  await b.load();
+  const got = await b.recall("site/x");
+  assert.equal(got?.body.toString(), "<p>kept</p>");
+  assert.equal(got?.headers["content-type"], "text/html");
+  assert.equal(await b.recall("site/never"), null);
 });
