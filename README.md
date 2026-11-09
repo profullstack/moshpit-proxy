@@ -279,6 +279,19 @@ browser --TLS (Moshpit CA leaf)--> edge --HTTP--> any healthy c0mpute gateway --
   that announce a gateway URL), re-checked every minute; the last good list is
   kept when discovery fails. No c0mpute server is on the path: any gateway can
   serve any site.
+- Only our own gateways (`C0MPUTE_GATEWAYS`, `C0MPUTE_TRUSTED_GATEWAYS`) are
+  proxied as they answer. Any c0mpute node can announce a gateway, so a
+  discovered one is a stranger's and gives only verified reads: the edge asks it
+  for `/hosting/v1/sites/<site>/resolve?path=...` (the owner-signed record, the
+  manifest and the file the path resolves to) and checks the ed25519 signature,
+  the site id, the manifest and parts by blake3, the path resolution (no
+  skipped candidate) and every chunk (`/hosting/v1/sites/<site>/chunks/<hash>`,
+  from any gateway) against its hash, the same rules as c0mpute's
+  `hosting/site.rs`. A record older than the highest seq already verified for
+  the site is refused (rollback). A gateway without those routes (c0mpute
+  before 0.3.5) or that fails a check sits out verified reads; the edge never
+  falls back to its unverified bytes. Verified responses carry
+  `x-c0mpute-verified: 1`; verified chunks are cached on disk by hash.
 - When every gateway fails, the edge retries the round on a Fibonacci schedule
   (0.5, 0.5, 1, 1.5, 2.5, 4 s), long enough to ride out a gateway restart or
   self-update. If they are still down it serves the last good copy of the page
@@ -295,6 +308,9 @@ browser --TLS (Moshpit CA leaf)--> edge --HTTP--> any healthy c0mpute gateway --
 | `MOSHPIT_API_KEY` | | the edge account's key; required to issue leaves |
 | `MOSHPIT_REGISTRY_BASE` | `https://pit.moshcode.sh` | |
 | `C0MPUTE_GATEWAYS` | | seed gateways, comma-separated (`http://host:7777`) |
+| `C0MPUTE_TRUSTED_GATEWAYS` | | more gateways of ours, served without verification |
+| `C0MPUTE_VERIFY_ALL` | off | `1`: verify our own gateways too |
+| `EDGE_CHUNK_DIR` | `$EDGE_CERT_DIR/chunks` | verified chunk cache (1 GiB); `off` disables |
 | `C0MPUTE_NODES_URL` | `https://c0mpute.com/api/nodes` | gateway discovery; empty disables |
 | `EDGE_CERT_DIR` | `/var/lib/moshpit/c0mpute-edge` | |
 | `EDGE_HTTPS_PORT` / `EDGE_HTTP_PORT` | `443` / `80` | `EDGE_HTTP_PORT=0` disables http |

@@ -6,6 +6,7 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { CertStore, GatewayPool, LastGood, SiteLookup, startEdge } from "../lib/c0mpute-edge.ts";
+import { ChunkCache, SeqGuard } from "../lib/c0mpute-verify.ts";
 
 /** `host:port` or `[v6]:port`, or null. */
 export function hostPort(v: string | undefined): { host: string; port: number } | null {
@@ -24,7 +25,12 @@ export function edgeConfig(env: Record<string, string | undefined> = process.env
     registryBase: env.MOSHPIT_REGISTRY_BASE || "https://pit.moshcode.sh",
     apiKey: env.MOSHPIT_API_KEY || "",
     certDir: env.EDGE_CERT_DIR || "/var/lib/moshpit/c0mpute-edge",
+    // Our own gateways: served from as they answer. Every gateway discovered
+    // from the node list is a stranger's and only ever gives verified reads.
     seeds: (env.C0MPUTE_GATEWAYS || "").split(/[\s,]+/).filter(Boolean),
+    trusted: (env.C0MPUTE_TRUSTED_GATEWAYS || "").split(/[\s,]+/).filter(Boolean),
+    // Verify every gateway, ours included.
+    verifyAll: /^(1|true|yes|on)$/i.test(env.C0MPUTE_VERIFY_ALL || ""),
     // The public node list, for gateways that announce a URL. Empty disables
     // discovery and the edge uses the seeds alone.
     nodesUrl: env.C0MPUTE_NODES_URL === undefined ? "https://c0mpute.com/api/nodes" : env.C0MPUTE_NODES_URL || null,
@@ -36,6 +42,10 @@ export function edgeConfig(env: Record<string, string | undefined> = process.env
     // Last good copy of every page, served stale when every gateway is down.
     // On disk so it survives a restart of the edge; "off" keeps it in memory only.
     staleDir: env.EDGE_STALE_DIR === "off" ? null : env.EDGE_STALE_DIR || `${env.EDGE_CERT_DIR || "/var/lib/moshpit/c0mpute-edge"}/stale`,
+    // Verified chunks (immutable, by hash) and the highest verified seq per
+    // site, so a restart neither refetches everything nor forgets the rollback floor.
+    chunkDir: env.EDGE_CHUNK_DIR === "off" ? null : env.EDGE_CHUNK_DIR || `${env.EDGE_CERT_DIR || "/var/lib/moshpit/c0mpute-edge"}/chunks`,
+    seqFile: `${env.EDGE_CERT_DIR || "/var/lib/moshpit/c0mpute-edge"}/site-seqs.json`,
   };
 }
 
@@ -44,7 +54,7 @@ async function main() {
   const log = (line: string) => console.log(line);
   if (!cfg.apiKey) log("[edge] warning: MOSHPIT_API_KEY is not set; only certificates already on disk can be served");
 
-  const gateways = new GatewayPool({ seeds: cfg.seeds, nodesUrl: cfg.nodesUrl });
+  const gateways = new GatewayPool({ seeds: cfg.seeds, trusted: cfg.trusted, nodesUrl: cfg.nodesUrl });
   await gateways.refresh();
   if (!gateways.size) log("[edge] warning: no c0mpute gateways known yet (set C0MPUTE_GATEWAYS)");
   const timer = setInterval(() => { void gateways.refresh(); }, cfg.refreshMs);
@@ -52,10 +62,14 @@ async function main() {
 
   const lastGood = new LastGood({ dir: cfg.staleDir });
   await lastGood.load();
+  const chunks = new ChunkCache({ dir: cfg.chunkDir });
+  await chunks.load();
+  const seqs = new SeqGuard({ file: cfg.seqFile });
+  await seqs.load();
   const sites = new SiteLookup({ registryBase: cfg.registryBase });
   const certs = new CertStore({ dir: cfg.certDir, registryBase: cfg.registryBase, apiKey: cfg.apiKey, log });
   await startEdge({ sites, gateways, certs, host: cfg.host, httpsPort: cfg.httpsPort, httpPort: cfg.httpPort,
-    proxyProtocol: cfg.proxyProtocol, fallback: cfg.fallback, lastGood, log });
+    proxyProtocol: cfg.proxyProtocol, fallback: cfg.fallback, lastGood, chunks, seqs, verifyAll: cfg.verifyAll, log });
   log(`[edge] serving c0mpute sites on https :${cfg.httpsPort}${cfg.httpPort ? ` and http :${cfg.httpPort}` : ""}; ${gateways.size} gateway(s) known${cfg.fallback ? `; other names to ${cfg.fallback.host}:${cfg.fallback.port}` : ""}`);
 }
 
