@@ -25,7 +25,10 @@ import {
   startEdge,
   upstreamUrl,
 } from "../lib/c0mpute-edge.ts";
-import { edgeConfig } from "../bin/moshpit-c0mpute-edge.ts";
+import { edgeConfig, hostPort } from "../bin/moshpit-c0mpute-edge.ts";
+import { clientHelloSni, proxyHeaderLength } from "../lib/sni-front.ts";
+import { connect as netConnect, createServer as createNetServer } from "node:net";
+import { connect as tlsConnect } from "node:tls";
 import { tempDir } from "./helpers.ts";
 
 const run = promisify(execFile);
@@ -86,6 +89,120 @@ test("edge config reads the environment", () => {
   assert.equal(c.httpPort, 0);
   assert.equal(edgeConfig({}).nodesUrl, "https://c0mpute.com/api/nodes");
   assert.equal(edgeConfig({}).httpsPort, 443);
+  assert.equal(edgeConfig({}).proxyProtocol, false);
+  assert.equal(edgeConfig({}).fallback, null);
+  const behind = edgeConfig({ EDGE_PROXY_PROTOCOL: "1", EDGE_FALLBACK: "127.0.0.1:8444" });
+  assert.equal(behind.proxyProtocol, true);
+  assert.deepEqual(behind.fallback, { host: "127.0.0.1", port: 8444 });
+  assert.deepEqual(hostPort("[::1]:443"), { host: "::1", port: 443 });
+  assert.equal(hostPort("127.0.0.1"), null);
+  assert.equal(hostPort("x:70000"), null);
+});
+
+/* ------------------------------------------------------- behind a router */
+
+/** The first bytes a real TLS client sends for `servername`. */
+function captureClientHello(servername?: string): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const srv = createNetServer((sock) => {
+      sock.once("data", (d: Buffer) => { resolve(d); sock.destroy(); srv.close(); });
+    });
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as AddressInfo).port;
+      const c = tlsConnect({ host: "127.0.0.1", port, ...(servername ? { servername } : {}), rejectUnauthorized: false });
+      c.on("error", () => {});
+    });
+  });
+}
+
+test("PROXY headers and the SNI are read off the front of a connection", async () => {
+  const v1 = Buffer.from("PROXY TCP4 1.2.3.4 5.6.7.8 1111 443\r\nrest");
+  assert.equal(proxyHeaderLength(v1), v1.indexOf("rest"));
+  assert.equal(proxyHeaderLength(Buffer.from("PROXY TCP4 1.2")), -1, "need more");
+  assert.equal(proxyHeaderLength(Buffer.from([0x16, 3, 1])), 0, "no header");
+  const v2 = Buffer.concat([Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0, 12]), Buffer.alloc(12), Buffer.from("x")]);
+  assert.equal(proxyHeaderLength(v2), 28);
+  assert.equal(proxyHeaderLength(v2.subarray(0, 20)), -1);
+
+  const hello = await captureClientHello("alt.2600");
+  assert.equal(clientHelloSni(hello), "alt.2600");
+  assert.equal(clientHelloSni(hello.subarray(0, 40)), undefined, "need more");
+  assert.equal(clientHelloSni(await captureClientHello()), null, "no SNI");
+  assert.equal(clientHelloSni(Buffer.from("GET / HTTP/1.1\r\n\r\n")), null, "not TLS");
+});
+
+test("behind an SNI router: c0mpute names terminate here, every other name is spliced to the fallback", async (t) => {
+  const dir = await tempDir("moshpit-edge-front-");
+  const ca = await makeCa(dir);
+  const good = await listen((req, res) => {
+    if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end(`gateway ${req.url}`);
+  });
+  const registry = await listen(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://x");
+    if (url.pathname === "/api/moshpit/resolve") {
+      const name = url.searchParams.get("name");
+      return res.end(JSON.stringify({ name, c0mpute: name === "blue.eggs" ? SITE : null }));
+    }
+    if (req.method === "POST" && url.pathname === "/api/moshpit/tlds/eggs/certs") {
+      const { label, csr } = JSON.parse(await body(req));
+      res.writeHead(201, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ chain: await sign(dir, ca, `${label}.eggs`, csr) }));
+    }
+    res.writeHead(404); res.end("{}");
+  });
+  // The fallback records exactly what it was sent, then answers.
+  const seen: Buffer[] = [];
+  const fallback = createNetServer((sock) => {
+    sock.once("data", (d: Buffer) => { seen.push(d); sock.end("FALLBACK"); });
+  });
+  await new Promise<void>((r) => fallback.listen(0, "127.0.0.1", () => r()));
+  const fbPort = (fallback.address() as AddressInfo).port;
+
+  const gateways = new GatewayPool({ seeds: [good.url] });
+  await gateways.refresh();
+  const sites = new SiteLookup({ registryBase: registry.url });
+  const certs = new CertStore({ dir: join(dir, "certs"), registryBase: registry.url, apiKey: "k" });
+  const edge = await startEdge({ sites, gateways, certs, host: "127.0.0.1", httpsPort: 0, httpPort: 0,
+    proxyProtocol: true, fallback: { host: "127.0.0.1", port: fbPort } });
+  const port = (edge.https.address() as AddressInfo).port;
+  t.after(async () => {
+    await edge.close();
+    for (const s of [good.server, registry.server, fallback]) s.close();
+  });
+  const PROXY = "PROXY TCP4 203.0.113.9 127.0.0.1 40000 443\r\n";
+
+  await t.test("a c0mpute name, after a PROXY header, gets its leaf and its site", async () => {
+    const text = await new Promise<string>((resolve, reject) => {
+      const raw = netConnect(port, "127.0.0.1", () => {
+        raw.write(PROXY);
+        const tls = tlsConnect({ socket: raw, servername: "blue.eggs", ca: ca.pem }, () => {
+          tls.write("GET /x HTTP/1.1\r\nHost: blue.eggs\r\nConnection: close\r\n\r\n");
+        });
+        let out = "";
+        tls.on("data", (d) => { out += d; });
+        tls.on("end", () => resolve(out));
+        tls.on("error", reject);
+      });
+    });
+    assert.match(text, /^HTTP\/1\.1 200/);
+    assert.match(text, new RegExp(`gateway /s/${SITE}/x`));
+  });
+
+  await t.test("any other name reaches the fallback byte for byte, PROXY header first", async () => {
+    const hello = await captureClientHello("red.eggs");
+    const reply = await new Promise<string>((resolve, reject) => {
+      const raw = netConnect(port, "127.0.0.1", () => { raw.write(Buffer.concat([Buffer.from(PROXY), hello])); });
+      let out = "";
+      raw.on("data", (d) => { out += d; });
+      raw.on("end", () => resolve(out));
+      raw.on("error", reject);
+    });
+    assert.equal(reply, "FALLBACK");
+    assert.equal(seen.length, 1);
+    assert.ok(seen[0].equals(Buffer.concat([Buffer.from(PROXY), hello])), "PROXY header and ClientHello untouched");
+  });
 });
 
 /* ------------------------------------------------------------ gateways */

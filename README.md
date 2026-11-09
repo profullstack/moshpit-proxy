@@ -291,9 +291,30 @@ browser --TLS (Moshpit CA leaf)--> edge --HTTP--> any healthy c0mpute gateway --
 | `C0MPUTE_NODES_URL` | `https://c0mpute.com/api/nodes` | gateway discovery; empty disables |
 | `EDGE_CERT_DIR` | `/var/lib/moshpit/c0mpute-edge` | |
 | `EDGE_HTTPS_PORT` / `EDGE_HTTP_PORT` | `443` / `80` | `EDGE_HTTP_PORT=0` disables http |
+| `EDGE_HOST` | `::` | listen address (`127.0.0.1` behind a router) |
+| `EDGE_PROXY_PROTOCOL` | off | `1`: expect a PROXY protocol header (v1 or v2) on https |
+| `EDGE_FALLBACK` | | `host:port` to splice every TLS connection that is not a c0mpute name to |
 
-It needs 80 and 443 to itself: run it on its own box or address, not behind the
+It wants 80 and 443 to itself: run it on its own box or address, not behind the
 origin nginx (which would answer with its own default certificate).
+
+**Sharing :443 with an origin.** On a box whose :443 already belongs to an SNI
+router (nginx `stream {}` with `ssl_preread`), the router cannot know which
+Moshpit names are c0mpute sites, since any holder can point one at c0mpute at
+any time. Route every Moshpit-shaped name the router has no other route for to
+the edge, and give the edge the old destination as `EDGE_FALLBACK`. The edge
+reads the PROXY header and the ClientHello's server name without terminating
+anything, terminates TLS only for names the registry says are c0mpute sites,
+and splices every other connection to the fallback byte for byte, PROXY header
+included, so names the box serves itself answer exactly as before:
+
+```
+EDGE_HOST=127.0.0.1
+EDGE_HTTPS_PORT=8456
+EDGE_HTTP_PORT=8457          # the box's :80 server proxies Moshpit names here
+EDGE_PROXY_PROTOCOL=1
+EDGE_FALLBACK=127.0.0.1:8444 # the router's old default backend
+```
 `systemd/moshpit-c0mpute-edge.service` runs it with its variables in
 `/etc/moshpit/c0mpute-edge.env`. Several edges behind one `MOSHPIT_C0MPUTE_EDGE`
 hostname (several A/AAAA records) is how it gets redundancy.
