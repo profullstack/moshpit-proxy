@@ -32,6 +32,8 @@ import { X509Certificate } from "node:crypto";
 import { createSecureContext } from "node:tls";
 import type { SecureContext, TLSSocket } from "node:tls";
 import { join } from "node:path";
+import type { Server as NetServer } from "node:net";
+import { createSniFront } from "./sni-front.ts";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -402,7 +404,9 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
     }
 
     const site = await opts.sites.site(host);
-    if (!site) return send(404, `${host} does not point at a c0mpute site`);
+    // 421, not 404: "this server does not answer for that name", which a front
+    // proxy can tell apart from a c0mpute site's own 404 (and park the name).
+    if (!site) return send(421, `${host} does not point at a c0mpute site`);
 
     const path = (req.url || "/").startsWith("/") ? (req.url || "/") : "/";
     for (const gw of opts.gateways.pick(attempts)) {
@@ -466,6 +470,17 @@ export interface EdgeServerOptions extends EdgeHandlerOptions {
   httpsPort?: number;
   /** 0 disables plain HTTP. */
   httpPort?: number;
+  /**
+   * Behind an SNI router that prepends a PROXY protocol header (v1 or v2) to
+   * every connection it hands the https port.
+   */
+  proxyProtocol?: boolean;
+  /**
+   * Where to splice TLS connections for names that are not c0mpute sites,
+   * instead of refusing them: the origin that owned them before the router
+   * started sending them here. See lib/sni-front.ts.
+   */
+  fallback?: { host: string; port: number } | null;
 }
 
 /**
@@ -474,7 +489,7 @@ export interface EdgeServerOptions extends EdgeHandlerOptions {
  * reason moshpit-origin.conf gives: a visitor who has not installed the Moshpit
  * root gets a working page over http instead of a certificate error.
  */
-export async function startEdge(opts: EdgeServerOptions): Promise<{ https: HttpsServer; http: HttpServer | null; close(): Promise<void> }> {
+export async function startEdge(opts: EdgeServerOptions): Promise<{ https: HttpsServer | NetServer; http: HttpServer | null; close(): Promise<void> }> {
   const handler = createEdgeHandler(opts);
   const onRequest = (req: IncomingMessage, res: ServerResponse) => {
     handler(req, res).catch(() => { try { res.destroy(); } catch { /* gone */ } });
@@ -493,22 +508,39 @@ export async function startEdge(opts: EdgeServerOptions): Promise<{ https: Https
     },
   }, onRequest);
 
-  const listen = (server: HttpServer | HttpsServer, port: number) => new Promise<void>((resolve, reject) => {
+  // In front of the TLS server when the edge shares :443 with an origin: the
+  // TLS server itself never listens, it is handed the sockets that are ours.
+  const front = opts.proxyProtocol || opts.fallback
+    ? createSniFront({
+      proxyProtocol: Boolean(opts.proxyProtocol),
+      fallback: opts.fallback ?? null,
+      serves: async (sni) => {
+        const name = normalizeHost(sni);
+        return Boolean(name && (await opts.sites.site(name)));
+      },
+      terminate: (socket) => { https.emit("connection", socket); },
+      log: opts.log,
+    })
+    : null;
+
+  const listen = (server: HttpServer | HttpsServer | NetServer, port: number) => new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, opts.host ?? "::", () => { server.off("error", reject); resolve(); });
   });
 
-  await listen(https, opts.httpsPort ?? 443);
+  const outer = front ?? https;
+  await listen(outer, opts.httpsPort ?? 443);
   let http: HttpServer | null = null;
   if (opts.httpPort !== 0) {
     http = createHttpServer(onRequest);
     await listen(http, opts.httpPort ?? 80);
   }
   return {
-    https,
+    https: outer,
     http,
     close: async () => {
-      await Promise.all([https, http].filter(Boolean).map((s) => new Promise<void>((r) => s!.close(() => r()))));
+      if (front) https.close();
+      await Promise.all([outer, http].filter(Boolean).map((s) => new Promise<void>((r) => s!.close(() => r()))));
     },
   };
 }
