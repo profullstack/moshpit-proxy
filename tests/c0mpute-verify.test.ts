@@ -15,6 +15,9 @@ import { join } from "node:path";
 import {
   ChunkCache,
   FILE_CHUNK_BYTES,
+  MAX_FREE_SITE_BYTES,
+  MAX_PARTS,
+  MAX_SITE_BYTES,
   SeqGuard,
   blake3hex,
   candidates,
@@ -243,6 +246,59 @@ test("v2 parted sites: parts verified by hash, a left-out part is refused, skipp
   const fooHtmlPart = partFor(s.refs, "zz/foo.html")!;
   const lie = { ...honest, path: "zz/foo.html", entry: s.entries.get("zz/foo.html")!, parts: [s.parts.get(fooHtmlPart.hash)!.toString("base64")] };
   assert.throws(() => verifyResolve(s.id, "/zz/foo", lie), /resolved|left out/);
+});
+
+test("size caps mirror site.rs (c0mpute 0.3.7): 4 TiB per site, 64 GiB on a v1 record, 2630 parts", () => {
+  const GIB = 1024 ** 3;
+  assert.equal(MAX_SITE_BYTES, 4 * 1024 * GIB);
+  assert.equal(MAX_FREE_SITE_BYTES, 64 * GIB);
+  assert.equal(MAX_PARTS, 2630);
+
+  const key = newKey();
+  const record = (v: 1 | 2, size: number) => {
+    const base = { site_id: siteIdFor(key.owner, "media"), name: "media", owner: key.owner, manifest: blake3hex("m"), seq: 1, size, domains: [] as string[] };
+    return v === 2
+      ? signRecord(key, { v: 2, ...base, preferred_hosts: ["12D3KooWFTsCjAVPKYnak1H8N7By5UpgeipVScmuAyGeRzzsLwSu"], price_per_gib_month: "0.004" })
+      : signRecord(key, { v: 1, ...base });
+  };
+  const id = siteIdFor(key.owner, "media");
+  assert.equal(verifyRecord(record(2, 3 * GIB), id).size, 3 * GIB);
+  assert.equal(verifyRecord(record(2, MAX_SITE_BYTES), id).size, MAX_SITE_BYTES);
+  assert.throws(() => verifyRecord(record(2, MAX_SITE_BYTES + 1), id), /size cap/);
+  assert.equal(verifyRecord(record(1, 2 * GIB), id).size, 2 * GIB);
+  assert.equal(verifyRecord(record(1, MAX_FREE_SITE_BYTES), id).size, MAX_FREE_SITE_BYTES);
+  assert.throws(() => verifyRecord(record(1, MAX_FREE_SITE_BYTES + 1), id), /size cap/);
+});
+
+test("a v2 site over 1 GiB verifies end to end, with more parts than files alone would need", () => {
+  const GIB = 1024 ** 3;
+  const key = newKey();
+  const name = "media";
+  const index = Buffer.from("<video src=big.mkv>");
+  const size = 3 * GIB + 5;
+  const big: FileEntry = { size, content_type: "video/x-matroska", chunks: Array.from({ length: Math.ceil(size / FILE_CHUNK_BYTES) }, (_, i) => blake3hex(`chunk ${i}`)) };
+  const entries: Record<string, FileEntry> = { "big.mkv": big, "index.html": { size: index.length, content_type: "text/html; charset=utf-8", chunks: [blake3hex(index)] } };
+  const partBytes = Buffer.from(JSON.stringify({ v: 2, files: entries }));
+  const real = { first: "big.mkv", hash: blake3hex(partBytes), files: 2, bytes: size + index.length };
+  // Striped media sites split parts by chunk count too, so a root may list
+  // more parts than MAX_FILES / PART_FILES (2500). Pad with empty-sized parts.
+  const site = (nParts: number, total = real.bytes) => {
+    const refs = [real];
+    for (let i = 1; i < nParts; i++) refs.push({ first: `zz/${String(i).padStart(5, "0")}`, hash: blake3hex(`part ${i}`), files: 1, bytes: 0 });
+    const files = refs.reduce((n, r) => n + r.files, 0);
+    const manifest = Buffer.from(JSON.stringify({ v: 2, name, files, bytes: total, parts: refs }));
+    const rec = signRecord(key, { v: 2, site_id: siteIdFor(key.owner, name), name, owner: key.owner, manifest: blake3hex(manifest), seq: 1, size: total, domains: [], preferred_hosts: ["12D3KooWFTsCjAVPKYnak1H8N7By5UpgeipVScmuAyGeRzzsLwSu"], price_per_gib_month: "0.004" });
+    return { id: rec.site_id, answer: (path: string | null, entry: FileEntry | null): ResolveAnswer => ({ v: 1, record: rec, manifest: manifest.toString("base64"), parts: [partBytes.toString("base64")], path, status: 200, entry }) };
+  };
+  const s = site(1);
+  const r = verifyResolve(s.id, "/big.mkv", s.answer("big.mkv", big));
+  assert.deepEqual([r.status, r.entry!.size, r.entry!.chunks.length], [200, size, 3073]);
+  assert.equal(verifyResolve(s.id, "/", s.answer("index.html", entries["index.html"])).path, "index.html");
+
+  const wide = site(MAX_PARTS);
+  assert.equal(verifyResolve(wide.id, "/big.mkv", wide.answer("big.mkv", big)).entry!.size, size);
+  const tooWide = site(MAX_PARTS + 1);
+  assert.throws(() => verifyResolve(tooWide.id, "/big.mkv", tooWide.answer("big.mkv", big)), /too many parts/);
 });
 
 test("chunks: hash and length checked", () => {
