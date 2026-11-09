@@ -245,6 +245,59 @@ The pin is `SHA-256(SubjectPublicKeyInfo)`, base64 — the RFC 7469 format, so
 `openssl x509 -pubkey | openssl pkey -pubin -outform der | openssl dgst -sha256`
 prints the same string. `tests/spki.test.ts` asserts we agree with openssl.
 
+## c0mpute edge
+
+`bin/moshpit-c0mpute-edge.ts` serves Moshpit names whose holders pointed them at
+a static site on [c0mpute](https://c0mpute.com), so `https://blue.eggs` works
+with no server of the holder's anywhere:
+
+```sh
+c0mpute hosting publish ./public --name blog        # prints the site id
+moshcode name c0mpute blue.eggs <site_id>           # one registry write
+```
+
+A c0mpute gateway serves any site at `http://<gateway>:7777/s/<site_id>/`, but
+it speaks plain HTTP and holds no certificate for a Moshpit name. The edge is
+the one hop that does:
+
+```
+browser --TLS (Moshpit CA leaf)--> edge --HTTP--> any healthy c0mpute gateway --libp2p--> hosting nodes
+```
+
+- The registry resolves a name with a c0mpute site to the edge's hostname
+  (`MOSHPIT_C0MPUTE_EDGE` on the registry), so every resolver already deployed
+  (the bridge, `dns.moshcode.sh`, TronBrowser) reaches it unchanged.
+- On the first handshake for a name the edge asks the registry which site it
+  is, generates a key, and asks the Moshpit CA for a leaf with its own API key.
+  The registry signs for the edge account (`MOSHPIT_C0MPUTE_EDGE_USERS`) only
+  while the holder has the name pointed at c0mpute. An SNI that is not a c0mpute
+  name never reaches the CA. Leaves are kept in `EDGE_CERT_DIR` and renewed in
+  the background inside their last ten days.
+- `https://blue.eggs/path` becomes `/s/<site_id>/path` on the fastest healthy
+  gateway, failing over to the next on a refused connection, a timeout or a 5xx.
+  Gateways come from `C0MPUTE_GATEWAYS` and from the public node list (nodes
+  that announce a gateway URL), re-checked every minute; the last good list is
+  kept when discovery fails. No c0mpute server is on the path: any gateway can
+  serve any site.
+- Plain `http://` serves the same sites rather than redirecting, for the reason
+  `nginx/moshpit-origin.conf` gives: a visitor without the Moshpit root gets a
+  page instead of a certificate error.
+
+| Variable | Default | |
+|---|---|---|
+| `MOSHPIT_API_KEY` | | the edge account's key; required to issue leaves |
+| `MOSHPIT_REGISTRY_BASE` | `https://pit.moshcode.sh` | |
+| `C0MPUTE_GATEWAYS` | | seed gateways, comma-separated (`http://host:7777`) |
+| `C0MPUTE_NODES_URL` | `https://c0mpute.com/api/nodes` | gateway discovery; empty disables |
+| `EDGE_CERT_DIR` | `/var/lib/moshpit/c0mpute-edge` | |
+| `EDGE_HTTPS_PORT` / `EDGE_HTTP_PORT` | `443` / `80` | `EDGE_HTTP_PORT=0` disables http |
+
+It needs 80 and 443 to itself: run it on its own box or address, not behind the
+origin nginx (which would answer with its own default certificate).
+`systemd/moshpit-c0mpute-edge.service` runs it with its variables in
+`/etc/moshpit/c0mpute-edge.env`. Several edges behind one `MOSHPIT_C0MPUTE_EDGE`
+hostname (several A/AAAA records) is how it gets redundancy.
+
 ## Gateway
 
 `nginx/moshpit-gateway.conf` — there is no `ssl_certificate` directive anywhere

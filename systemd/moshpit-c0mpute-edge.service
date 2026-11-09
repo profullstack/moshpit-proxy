@@ -1,0 +1,29 @@
+[Unit]
+# Serves Moshpit names whose holders pointed them at a c0mpute site
+# (`moshcode name c0mpute <name> <site_id>`): TLS with a leaf the registry signs
+# for each name, content from whichever c0mpute gateways are healthy.
+Description=Moshpit c0mpute edge
+Documentation=https://github.com/profullstack/moshpit-proxy#c0mpute-edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# MOSHPIT_API_KEY (the edge account's key; the registry must list that account
+# in MOSHPIT_C0MPUTE_EDGE_USERS), optional C0MPUTE_GATEWAYS seeds and the rest
+# of the EDGE_* variables live here, root-only.
+EnvironmentFile=/etc/moshpit/c0mpute-edge.env
+ExecStart=/usr/bin/env node /opt/moshpit/bin/moshpit-c0mpute-edge.ts
+StateDirectory=moshpit/c0mpute-edge
+Environment=EDGE_CERT_DIR=/var/lib/moshpit/c0mpute-edge
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

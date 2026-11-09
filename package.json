@@ -8,14 +8,16 @@
   "bin": {
     "moshpit-proxy": "bin/moshpit-proxy.ts",
     "moshpit-pin": "bin/moshpit-pin.ts",
-    "moshpit-trust": "bin/moshpit-trust.ts"
+    "moshpit-trust": "bin/moshpit-trust.ts",
+    "moshpit-c0mpute-edge": "bin/moshpit-c0mpute-edge.ts"
   },
   "scripts": {
     "start": "node bin/moshpit-proxy.ts",
     "pin": "node bin/moshpit-pin.ts",
     "trust": "node bin/moshpit-trust.ts",
     "upstreams": "node scripts/gen-upstreams.ts",
-    "test": "node --test tests/*.test.ts"
+    "test": "node --test tests/*.test.ts",
+    "edge": "node bin/moshpit-c0mpute-edge.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
