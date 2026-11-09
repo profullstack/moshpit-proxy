@@ -27,11 +27,19 @@ import { blake3 } from "../vendor/noble-hashes/blake3.js";
 
 /** Files are cut into chunks of this size (site.rs FILE_CHUNK_BYTES). */
 export const FILE_CHUNK_BYTES = 1024 * 1024;
-/** Largest site (site.rs MAX_SITE_BYTES). */
-export const MAX_SITE_BYTES = 1024 * 1024 * 1024;
+const GIB = 1024 * 1024 * 1024;
+/** Largest site: a v2 record, an inline manifest, a parted root (site.rs MAX_SITE_BYTES, 4 TiB). */
+export const MAX_SITE_BYTES = 4 * 1024 * GIB;
+/** Largest site a v1 (free) record may claim (site.rs MAX_FREE_SITE_BYTES). */
+export const MAX_FREE_SITE_BYTES = 64 * GIB;
 const MAX_FILES = 10_000_000;
 const MAX_INLINE_FILES = 10_000;
 const PART_FILES = 4_000;
+/** Chunks per manifest part, besides PART_FILES (site.rs PART_CHUNKS). */
+const PART_CHUNKS = 65_536;
+/** Most parts a v2 root may list (site.rs MAX_PARTS): 2500 + 2 * 64 + 2 = 2630. */
+export const MAX_PARTS = Math.ceil(MAX_FILES / PART_FILES)
+  + 2 * Math.ceil(MAX_SITE_BYTES / FILE_CHUNK_BYTES / PART_CHUNKS) + 2;
 
 const HASH_RE = /^[0-9a-f]{64}$/;
 const KEY_RE = /^[0-9a-f]{64}$/;
@@ -124,7 +132,7 @@ export function verifyRecord(input: unknown, siteId: string): SiteRecord {
   if (!NAME_RE.test(r.name)) fail("bad site name");
   if (!KEY_RE.test(r.owner)) fail("owner is not a hex ed25519 key");
   if (!HASH_RE.test(r.manifest)) fail("manifest is not a hash");
-  if (r.size > MAX_SITE_BYTES) fail("site is over the size cap");
+  if (r.size > (r.v >= 2 ? MAX_SITE_BYTES : MAX_FREE_SITE_BYTES)) fail("site is over the size cap");
   if (!SITE_RE.test(siteId) || r.site_id !== siteId) fail("record is for another site");
   if (siteIdFor(r.owner, r.name) !== r.site_id) fail("site id does not match owner and name");
   if (!ed25519Verify(r.owner, r.sig, signingBytes({ ...r, domains }))) fail("bad record signature");
@@ -196,7 +204,7 @@ export function verifyManifest(bytes: Uint8Array, record: SiteRecord): Manifest 
     const parts = m.parts as PartRef[];
     if (!isU64(m.files) || !isU64(m.bytes) || !Array.isArray(parts) || parts.length === 0) fail("manifest root malformed");
     if ((m.files as number) > MAX_FILES || (m.bytes as number) > MAX_SITE_BYTES) fail("manifest root out of bounds");
-    if (parts.length > Math.ceil(MAX_FILES / PART_FILES)) fail("manifest has too many parts");
+    if (parts.length > MAX_PARTS) fail("manifest has too many parts");
     let files = 0, total = 0;
     for (const p of parts) {
       if (!p || typeof p.first !== "string" || typeof p.hash !== "string" || !isU64(p.files) || !isU64(p.bytes)
