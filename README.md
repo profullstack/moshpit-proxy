@@ -306,7 +306,10 @@ the edge, and give the edge the old destination as `EDGE_FALLBACK`. The edge
 reads the PROXY header and the ClientHello's server name without terminating
 anything, terminates TLS only for names the registry says are c0mpute sites,
 and splices every other connection to the fallback byte for byte, PROXY header
-included, so names the box serves itself answer exactly as before:
+included, so names the box serves itself answer exactly as before. Over plain
+http a name that is not a c0mpute site gets `421 Misdirected Request` (a
+site's own missing page is a 404), so the box's :80 server can intercept the
+421 and do what it did before, such as parking the name:
 
 ```
 EDGE_HOST=127.0.0.1

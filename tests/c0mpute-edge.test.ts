@@ -422,7 +422,7 @@ test("plain http serves the same sites, GET and HEAD only, 502 when no gateway a
   assert.equal(failures, 1, "g1's 502 counted against it");
   assert.equal((await call("HEAD", "blue.eggs")).text, "");
   assert.equal((await call("POST", "blue.eggs")).status, 405);
-  assert.equal((await call("GET", "red.eggs")).status, 404);
+  assert.equal((await call("GET", "red.eggs")).status, 421, "not a c0mpute name: misdirected, not a missing page");
   assert.equal((await call("GET", "127.0.0.1")).status, 400);
   up = false;
   assert.equal((await call("GET", "blue.eggs")).status, 502);

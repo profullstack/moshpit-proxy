@@ -404,7 +404,9 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
     }
 
     const site = await opts.sites.site(host);
-    if (!site) return send(404, `${host} does not point at a c0mpute site`);
+    // 421, not 404: "this server does not answer for that name", which a front
+    // proxy can tell apart from a c0mpute site's own 404 (and park the name).
+    if (!site) return send(421, `${host} does not point at a c0mpute site`);
 
     const path = (req.url || "/").startsWith("/") ? (req.url || "/") : "/";
     for (const gw of opts.gateways.pick(attempts)) {
