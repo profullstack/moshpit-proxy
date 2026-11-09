@@ -21,6 +21,12 @@
 // site, so there is no c0mpute server on the path to lose. Gateways are
 // discovered from seeds and from the public node list (nodes that announce a
 // gateway URL), and the last good list is kept when discovery fails.
+//
+// When every gateway fails a request the edge does not give up at once: it
+// retries the round a few times on a Fibonacci schedule (a gateway restarting
+// or re-executing for an update is back within seconds), then serves the last
+// good copy of that page it saw (marked stale), and only then a 503 page with
+// Retry-After. A failing gateway also sits out on a Fibonacci schedule.
 
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -48,6 +54,27 @@ export function normalizeHost(input: string | undefined | null): string | null {
   const raw = String(input ?? "").trim().toLowerCase().replace(/\.$/, "");
   const host = raw.replace(/:\d+$/, "");
   return NAME_RE.test(host) ? host : null;
+}
+
+/* -------------------------------------------------------------- backoff */
+
+/**
+ * The first `n` Fibonacci multiples of `baseMs` (1, 1, 2, 3, 5, 8 ...), each
+ * capped at `capMs`. The retry schedule everywhere in the edge.
+ */
+export function fibonacciDelays(n: number, baseMs: number, capMs = Number.MAX_SAFE_INTEGER): number[] {
+  const out: number[] = [];
+  let a = 1, b = 1;
+  for (let i = 0; i < n; i++) {
+    out.push(Math.min(capMs, a * baseMs));
+    [a, b] = [b, a + b];
+  }
+  return out;
+}
+
+/** The `k`th (1-based) Fibonacci multiple of `baseMs`, capped. */
+export function fibonacciDelay(k: number, baseMs: number, capMs = Number.MAX_SAFE_INTEGER): number {
+  return fibonacciDelays(Math.max(1, Math.min(k, 60)), baseMs, capMs).at(-1)!;
 }
 
 /* ------------------------------------------------------------- gateways */
@@ -162,8 +189,8 @@ export class GatewayPool {
     if (!s) return;
     s.failures += 1;
     s.healthy = false;
-    // 10 s, 20 s, 40 s ... capped at 5 minutes.
-    s.downUntil = this.now() + Math.min(300_000, 10_000 * 2 ** (s.failures - 1));
+    // 5 s, 5 s, 10 s, 15 s, 25 s, 40 s ... capped at 5 minutes.
+    s.downUntil = this.now() + fibonacciDelay(s.failures, 5_000, 300_000);
   }
 
   /**
@@ -367,8 +394,70 @@ export interface EdgeHandlerOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   attempts?: number;
+  /** Extra rounds over the gateways after the first fails, Fibonacci spaced. Default 4. */
+  retries?: number;
+  /** The first retry's wait; later ones are Fibonacci multiples. Default 500 ms. */
+  retryBaseMs?: number;
+  /** Last good copies to serve when every gateway fails; null disables. */
+  lastGood?: LastGood | null;
+  sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
 }
+
+/** One page as a gateway last served it. */
+type Kept = { status: number; headers: Record<string, string>; body: Buffer; at: number };
+
+/**
+ * The last good copy of each page, so a visitor gets the site (marked stale)
+ * instead of an error while every gateway is down. In memory, least recently
+ * used out first, bounded per page and in total.
+ */
+export class LastGood {
+  private pages = new Map<string, Kept>();
+  private bytes = 0;
+  readonly maxEntryBytes: number;
+  readonly maxBytes: number;
+  private now: () => number;
+
+  constructor(opts: { maxEntryBytes?: number; maxBytes?: number; now?: () => number } = {}) {
+    this.maxEntryBytes = opts.maxEntryBytes ?? 4 * 1024 * 1024;
+    this.maxBytes = opts.maxBytes ?? 128 * 1024 * 1024;
+    this.now = opts.now ?? Date.now;
+  }
+
+  static key(site: string, path: string): string { return `${site}${path}`; }
+
+  get size(): number { return this.pages.size; }
+
+  get(key: string): Kept | null {
+    const k = this.pages.get(key);
+    if (!k) return null;
+    this.pages.delete(key);
+    this.pages.set(key, k);
+    return k;
+  }
+
+  put(key: string, status: number, headers: Record<string, string>, body: Buffer): void {
+    if (body.length > this.maxEntryBytes) return;
+    const old = this.pages.get(key);
+    if (old) { this.bytes -= old.body.length; this.pages.delete(key); }
+    this.pages.set(key, { status, headers, body, at: this.now() });
+    this.bytes += body.length;
+    while (this.bytes > this.maxBytes && this.pages.size) {
+      const [k, v] = this.pages.entries().next().value as [string, Kept];
+      this.pages.delete(k);
+      this.bytes -= v.body.length;
+    }
+  }
+}
+
+const FAIL_PAGE = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Back in a moment</title><meta http-equiv="refresh" content="30">
+<body style="background:#070806;color:#edf2e4;font-family:monospace;padding:14vh 24px;text-align:center">
+<h1 style="color:#a6ff1a">back in a moment</h1>
+<p>no c0mpute gateway could serve this site just now; the network is healing itself.</p>
+<p>this page retries on its own every 30 seconds.</p></body>
+`;
 
 /** The gateway URL for a request path on a site. */
 export function upstreamUrl(gateway: string, site: string, path: string): string {
@@ -381,6 +470,10 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const attempts = opts.attempts ?? 3;
+  const retries = opts.retries ?? 4;
+  const delays = fibonacciDelays(retries, opts.retryBaseMs ?? 500, 10_000);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const lastGood = opts.lastGood === undefined ? new LastGood() : opts.lastGood;
   const log = opts.log ?? (() => {});
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -409,56 +502,91 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
     if (!site) return send(421, `${host} does not point at a c0mpute site`);
 
     const path = (req.url || "/").startsWith("/") ? (req.url || "/") : "/";
-    for (const gw of opts.gateways.pick(attempts)) {
-      let upstream: Response;
-      try {
-        upstream = await fetchImpl(upstreamUrl(gw, site, path), {
-          method: req.method,
-          headers: {
-            ...(req.headers["if-none-match"] ? { "if-none-match": String(req.headers["if-none-match"]) } : {}),
-            ...(req.headers["accept-encoding"] ? { "accept-encoding": String(req.headers["accept-encoding"]) } : {}),
-          },
-          redirect: "manual",
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-      } catch (e) {
-        opts.gateways.failed(gw);
-        log(`[edge] ${host} via ${gw}: ${(e as Error).message}`);
-        continue;
-      }
-      if (upstream.status >= 500) {
-        await upstream.body?.cancel();
-        opts.gateways.failed(gw);
-        log(`[edge] ${host} via ${gw}: ${upstream.status}`);
-        continue;
-      }
-      opts.gateways.succeeded(gw);
-      const headers: Record<string, string> = { "x-c0mpute-gateway": new URL(gw).host };
-      for (const h of PASS_HEADERS) {
-        const v = upstream.headers.get(h);
-        if (v !== null) headers[h] = v;
-      }
-      res.writeHead(upstream.status, headers);
-      if (req.method === "HEAD" || !upstream.body) {
-        await upstream.body?.cancel();
-        res.end();
-        return;
-      }
-      const reader = upstream.body.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!res.write(value)) await new Promise((r) => res.once("drain", r));
+    const key = LastGood.key(site, path);
+    const conditional = Boolean(req.headers["if-none-match"]);
+
+    // One pass over the gateways; true when a response was sent.
+    const tryRound = async (): Promise<boolean> => {
+      for (const gw of opts.gateways.pick(attempts)) {
+        let upstream: Response;
+        try {
+          upstream = await fetchImpl(upstreamUrl(gw, site, path), {
+            method: req.method,
+            headers: {
+              ...(conditional ? { "if-none-match": String(req.headers["if-none-match"]) } : {}),
+              ...(req.headers["accept-encoding"] ? { "accept-encoding": String(req.headers["accept-encoding"]) } : {}),
+            },
+            redirect: "manual",
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+        } catch (e) {
+          opts.gateways.failed(gw);
+          log(`[edge] ${host} via ${gw}: ${(e as Error).message}`);
+          continue;
         }
-      } catch {
-        res.destroy();
-        return;
+        if (upstream.status >= 500) {
+          await upstream.body?.cancel();
+          opts.gateways.failed(gw);
+          log(`[edge] ${host} via ${gw}: ${upstream.status}`);
+          continue;
+        }
+        opts.gateways.succeeded(gw);
+        const headers: Record<string, string> = { "x-c0mpute-gateway": new URL(gw).host };
+        for (const h of PASS_HEADERS) {
+          const v = upstream.headers.get(h);
+          if (v !== null) headers[h] = v;
+        }
+        res.writeHead(upstream.status, headers);
+        if (req.method === "HEAD" || !upstream.body) {
+          await upstream.body?.cancel();
+          res.end();
+          return true;
+        }
+        // Keep a copy of a full 200 for the day every gateway is down.
+        const keep = lastGood && upstream.status === 200 && !headers["content-encoding"] ? [] as Buffer[] : null;
+        let kept = 0;
+        const reader = upstream.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (keep) {
+              kept += value.length;
+              if (kept <= lastGood!.maxEntryBytes) keep.push(Buffer.from(value));
+            }
+            if (!res.write(value)) await new Promise((r) => res.once("drain", r));
+          }
+        } catch {
+          res.destroy();
+          return true;
+        }
+        res.end();
+        if (keep && kept <= lastGood!.maxEntryBytes) lastGood!.put(key, 200, headers, Buffer.concat(keep));
+        return true;
       }
-      res.end();
+      return false;
+    };
+
+    if (await tryRound()) return;
+    for (const ms of delays) {
+      if (res.destroyed || req.socket.destroyed) return;
+      await sleep(ms);
+      if (await tryRound()) return;
+    }
+
+    const stale = lastGood?.get(key);
+    if (stale) {
+      log(`[edge] ${host}${path}: every gateway failed ${delays.length + 1} rounds; serving the last good copy`);
+      const headers: Record<string, string> = { ...stale.headers, "x-c0mpute-stale": "1",
+        "cache-control": "no-store", "content-length": String(stale.body.length) };
+      delete headers["content-encoding"];
+      res.writeHead(stale.status, headers);
+      res.end(req.method === "HEAD" ? undefined : stale.body);
       return;
     }
-    send(502, "no c0mpute gateway answered for this site; try again shortly");
+    log(`[edge] ${host}${path}: every gateway failed ${delays.length + 1} rounds; no copy kept`);
+    res.writeHead(503, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "retry-after": "30" });
+    res.end(req.method === "HEAD" ? undefined : FAIL_PAGE);
   };
 }
 
