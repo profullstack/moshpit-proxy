@@ -29,12 +29,12 @@
 // Retry-After. A failing gateway also sits out on a Fibonacci schedule.
 
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { Server as HttpsServer } from "node:https";
-import { X509Certificate } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { createSecureContext } from "node:tls";
 import type { SecureContext, TLSSocket } from "node:tls";
 import { join } from "node:path";
@@ -394,7 +394,7 @@ export interface EdgeHandlerOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   attempts?: number;
-  /** Extra rounds over the gateways after the first fails, Fibonacci spaced. Default 4. */
+  /** Extra rounds over the gateways after the first fails, Fibonacci spaced. Default 6 (~10 s, a gateway restart). */
   retries?: number;
   /** The first retry's wait; later ones are Fibonacci multiples. Default 500 ms. */
   retryBaseMs?: number;
@@ -417,17 +417,46 @@ export class LastGood {
   private bytes = 0;
   readonly maxEntryBytes: number;
   readonly maxBytes: number;
+  readonly maxDiskBytes: number;
+  private dir: string | null;
   private now: () => number;
 
-  constructor(opts: { maxEntryBytes?: number; maxBytes?: number; now?: () => number } = {}) {
+  /**
+   * `dir` keeps every copy on disk too, so they outlive a restart of the edge
+   * (the moment they are most needed is right after one). Pruned oldest first
+   * past `maxDiskBytes` on `load()`.
+   */
+  constructor(opts: { maxEntryBytes?: number; maxBytes?: number; maxDiskBytes?: number; dir?: string | null; now?: () => number } = {}) {
     this.maxEntryBytes = opts.maxEntryBytes ?? 4 * 1024 * 1024;
     this.maxBytes = opts.maxBytes ?? 128 * 1024 * 1024;
+    this.maxDiskBytes = opts.maxDiskBytes ?? 1024 * 1024 * 1024;
+    this.dir = opts.dir ?? null;
     this.now = opts.now ?? Date.now;
   }
 
   static key(site: string, path: string): string { return `${site}${path}`; }
 
   get size(): number { return this.pages.size; }
+
+  private file(key: string): string {
+    return join(this.dir!, `${createHash("sha256").update(key).digest("hex")}.page`);
+  }
+
+  /** Create the directory and prune it to `maxDiskBytes`, oldest first. Never throws. */
+  async load(): Promise<void> {
+    if (!this.dir) return;
+    try {
+      await mkdir(this.dir, { recursive: true });
+      const files = await Promise.all((await readdir(this.dir)).filter((f) => f.endsWith(".page"))
+        .map(async (f) => ({ f, st: await stat(join(this.dir!, f)) })));
+      files.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
+      let total = 0;
+      for (const { f, st } of files) {
+        total += st.size;
+        if (total > this.maxDiskBytes) await unlink(join(this.dir, f)).catch(() => {});
+      }
+    } catch { /* no disk copies, memory only */ }
+  }
 
   get(key: string): Kept | null {
     const k = this.pages.get(key);
@@ -437,12 +466,40 @@ export class LastGood {
     return k;
   }
 
+  /** From memory, else from disk (and back into memory). */
+  async recall(key: string): Promise<Kept | null> {
+    const hit = this.get(key);
+    if (hit || !this.dir) return hit;
+    try {
+      const raw = await readFile(this.file(key));
+      const nl = raw.indexOf(10);
+      const meta = JSON.parse(raw.subarray(0, nl).toString("utf8")) as { key: string; status: number; headers: Record<string, string>; at: number };
+      if (meta.key !== key) return null;
+      const body = raw.subarray(nl + 1);
+      this.remember(key, { status: meta.status, headers: meta.headers, body, at: meta.at });
+      return this.pages.get(key) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   put(key: string, status: number, headers: Record<string, string>, body: Buffer): void {
     if (body.length > this.maxEntryBytes) return;
+    const kept = { status, headers, body, at: this.now() };
+    this.remember(key, kept);
+    if (this.dir) {
+      const file = this.file(key);
+      const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}`;
+      const head = Buffer.from(`${JSON.stringify({ key, status, headers, at: kept.at })}\n`);
+      writeFile(tmp, Buffer.concat([head, body])).then(() => rename(tmp, file)).catch(() => { unlink(tmp).catch(() => {}); });
+    }
+  }
+
+  private remember(key: string, kept: Kept): void {
     const old = this.pages.get(key);
     if (old) { this.bytes -= old.body.length; this.pages.delete(key); }
-    this.pages.set(key, { status, headers, body, at: this.now() });
-    this.bytes += body.length;
+    this.pages.set(key, kept);
+    this.bytes += kept.body.length;
     while (this.bytes > this.maxBytes && this.pages.size) {
       const [k, v] = this.pages.entries().next().value as [string, Kept];
       this.pages.delete(k);
@@ -470,7 +527,7 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const attempts = opts.attempts ?? 3;
-  const retries = opts.retries ?? 4;
+  const retries = opts.retries ?? 6;
   const delays = fibonacciDelays(retries, opts.retryBaseMs ?? 500, 10_000);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const lastGood = opts.lastGood === undefined ? new LastGood() : opts.lastGood;
@@ -574,7 +631,7 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
       if (await tryRound()) return;
     }
 
-    const stale = lastGood?.get(key);
+    const stale = lastGood ? await lastGood.recall(key) : null;
     if (stale) {
       log(`[edge] ${host}${path}: every gateway failed ${delays.length + 1} rounds; serving the last good copy`);
       const headers: Record<string, string> = { ...stale.headers, "x-c0mpute-stale": "1",

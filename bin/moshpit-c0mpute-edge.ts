@@ -5,7 +5,7 @@
 
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { CertStore, GatewayPool, SiteLookup, startEdge } from "../lib/c0mpute-edge.ts";
+import { CertStore, GatewayPool, LastGood, SiteLookup, startEdge } from "../lib/c0mpute-edge.ts";
 
 /** `host:port` or `[v6]:port`, or null. */
 export function hostPort(v: string | undefined): { host: string; port: number } | null {
@@ -33,6 +33,9 @@ export function edgeConfig(env: Record<string, string | undefined> = process.env
     proxyProtocol: /^(1|true|yes|on)$/i.test(env.EDGE_PROXY_PROTOCOL || ""),
     fallback: hostPort(env.EDGE_FALLBACK),
     refreshMs: int(env.C0MPUTE_REFRESH_SECONDS, 60) * 1000,
+    // Last good copy of every page, served stale when every gateway is down.
+    // On disk so it survives a restart of the edge; "off" keeps it in memory only.
+    staleDir: env.EDGE_STALE_DIR === "off" ? null : env.EDGE_STALE_DIR || `${env.EDGE_CERT_DIR || "/var/lib/moshpit/c0mpute-edge"}/stale`,
   };
 }
 
@@ -47,10 +50,12 @@ async function main() {
   const timer = setInterval(() => { void gateways.refresh(); }, cfg.refreshMs);
   timer.unref();
 
+  const lastGood = new LastGood({ dir: cfg.staleDir });
+  await lastGood.load();
   const sites = new SiteLookup({ registryBase: cfg.registryBase });
   const certs = new CertStore({ dir: cfg.certDir, registryBase: cfg.registryBase, apiKey: cfg.apiKey, log });
   await startEdge({ sites, gateways, certs, host: cfg.host, httpsPort: cfg.httpsPort, httpPort: cfg.httpPort,
-    proxyProtocol: cfg.proxyProtocol, fallback: cfg.fallback, log });
+    proxyProtocol: cfg.proxyProtocol, fallback: cfg.fallback, lastGood, log });
   log(`[edge] serving c0mpute sites on https :${cfg.httpsPort}${cfg.httpPort ? ` and http :${cfg.httpPort}` : ""}; ${gateways.size} gateway(s) known${cfg.fallback ? `; other names to ${cfg.fallback.host}:${cfg.fallback.port}` : ""}`);
 }
 

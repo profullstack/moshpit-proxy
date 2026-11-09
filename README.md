@@ -280,9 +280,10 @@ browser --TLS (Moshpit CA leaf)--> edge --HTTP--> any healthy c0mpute gateway --
   kept when discovery fails. No c0mpute server is on the path: any gateway can
   serve any site.
 - When every gateway fails, the edge retries the round on a Fibonacci schedule
-  (0.5 s, 0.5 s, 1 s, 1.5 s), long enough to ride out a gateway restart or
+  (0.5, 0.5, 1, 1.5, 2.5, 4 s), long enough to ride out a gateway restart or
   self-update. If they are still down it serves the last good copy of the page
-  (kept in memory, 4 MiB per page, 128 MiB in all, marked `x-c0mpute-stale: 1`),
+  (4 MiB per page, 128 MiB in memory, also on disk in `EDGE_STALE_DIR` so it
+  survives a restart, 1 GiB, marked `x-c0mpute-stale: 1`),
   and only then a 503 page with `Retry-After: 30` that reloads itself. A failing
   gateway sits out 5 s, 5 s, 10 s, 15 s, 25 s ... up to 5 minutes.
 - Plain `http://` serves the same sites rather than redirecting, for the reason
