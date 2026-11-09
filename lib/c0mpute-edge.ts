@@ -22,6 +22,12 @@
 // discovered from seeds and from the public node list (nodes that announce a
 // gateway URL), and the last good list is kept when discovery fails.
 //
+// Any c0mpute node may announce a gateway, so only our own (the seeds and
+// C0MPUTE_TRUSTED_GATEWAYS) are proxied as they answer. A discovered gateway is
+// a stranger's: from it the edge serves only what it has checked against the
+// site owner's signature (lib/c0mpute-verify.ts), and a gateway that cannot
+// give a verified read is skipped, never served from unverified.
+//
 // When every gateway fails a request the edge does not give up at once: it
 // retries the round a few times on a Fibonacci schedule (a gateway restarting
 // or re-executing for an update is back within seconds), then serves the last
@@ -40,6 +46,7 @@ import type { SecureContext, TLSSocket } from "node:tls";
 import { join } from "node:path";
 import type { Server as NetServer } from "node:net";
 import { createSniFront } from "./sni-front.ts";
+import { ChunkCache, SeqGuard, VerifyError, chunkLength, entryEtag, verifyChunk, verifyResolve } from "./c0mpute-verify.ts";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -107,7 +114,12 @@ export function gatewaysFromNodes(payload: unknown): string[] {
 type GatewayState = { url: string; healthy: boolean; rttMs: number; failures: number; downUntil: number };
 
 export interface GatewayPoolOptions {
+  /** Gateways to start from. Trusted (served from without verification) unless `trustSeeds` is false. */
   seeds?: string[];
+  /** More gateways that are ours and served from without verification. */
+  trusted?: string[];
+  /** Default true: the seeds are our own gateways. */
+  trustSeeds?: boolean;
   /** A node list to discover gateways from; null disables discovery. */
   nodesUrl?: string | null;
   fetchImpl?: typeof fetch;
@@ -126,6 +138,7 @@ export interface GatewayPoolOptions {
 export class GatewayPool {
   private states = new Map<string, GatewayState>();
   private seeds: string[];
+  private trusted: Set<string>;
   private nodesUrl: string | null;
   private fetchImpl: typeof fetch;
   private timeoutMs: number;
@@ -133,7 +146,10 @@ export class GatewayPool {
   private turn = 0;
 
   constructor(opts: GatewayPoolOptions = {}) {
-    this.seeds = (opts.seeds ?? []).map(normalizeGateway).filter((u): u is string => Boolean(u));
+    const norm = (list: string[] | undefined) => (list ?? []).map(normalizeGateway).filter((u): u is string => Boolean(u));
+    const extra = norm(opts.trusted);
+    this.seeds = [...new Set([...norm(opts.seeds), ...extra])];
+    this.trusted = new Set([...(opts.trustSeeds === false ? [] : norm(opts.seeds)), ...extra]);
     this.nodesUrl = opts.nodesUrl ?? null;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 3000;
@@ -151,6 +167,13 @@ export class GatewayPool {
   }
 
   get size(): number { return this.states.size; }
+
+  /**
+   * True for our own gateways (seeds and C0MPUTE_TRUSTED_GATEWAYS). Anything
+   * discovered from the node list is a stranger's, and the edge serves its
+   * bytes only after checking them against the site owner's signature.
+   */
+  isTrusted(url: string): boolean { return this.trusted.has(url); }
 
   /** Rediscover and re-check every gateway. Never throws; a failed discovery keeps the old list. */
   async refresh(): Promise<void> {
@@ -390,7 +413,18 @@ const PASS_HEADERS = ["content-type", "content-length", "etag", "last-modified",
 
 export interface EdgeHandlerOptions {
   sites: Pick<SiteLookup, "site">;
-  gateways: Pick<GatewayPool, "pick" | "succeeded" | "failed">;
+  /**
+   * `isTrusted` says which gateways are ours; a pool without it is taken to be
+   * all ours (the edge before any node could be a gateway).
+   */
+  gateways: Pick<GatewayPool, "pick" | "succeeded" | "failed"> & Partial<Pick<GatewayPool, "isTrusted">>;
+  /** Verify trusted gateways too (C0MPUTE_VERIFY_ALL). */
+  verifyAll?: boolean;
+  /** Highest verified seq per site (rollback guard). In memory by default. */
+  seqs?: SeqGuard;
+  /** Verified chunks by hash. None (no cache) by default. */
+  chunks?: ChunkCache;
+  now?: () => number;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   attempts?: number;
@@ -532,6 +566,19 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const lastGood = opts.lastGood === undefined ? new LastGood() : opts.lastGood;
   const log = opts.log ?? (() => {});
+  const now = opts.now ?? Date.now;
+  const verifyAll = Boolean(opts.verifyAll);
+  const seqs = opts.seqs ?? new SeqGuard();
+  const chunks = opts.chunks ?? new ChunkCache();
+  // Gateways that cannot do verified reads just now (no resolve route yet, or
+  // caught lying), and until when they sit those out.
+  const unverifiable = new Map<string, number>();
+  const trusted = (gw: string) => !verifyAll && (opts.gateways.isTrusted ? opts.gateways.isTrusted(gw) : true);
+  const sittingOut = (gw: string) => (unverifiable.get(gw) ?? 0) > now();
+  const sitOut = (gw: string, ms: number, why: string) => {
+    if (!sittingOut(gw)) log(`[edge] ${gw}: no verified reads for ${Math.round(ms / 1000)} s: ${why}`);
+    unverifiable.set(gw, now() + ms);
+  };
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const send = (status: number, text: string) => {
@@ -564,7 +611,14 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
 
     // One pass over the gateways; true when a response was sent.
     const tryRound = async (): Promise<boolean> => {
-      for (const gw of opts.gateways.pick(attempts)) {
+      // Gateways that cannot serve a verified read just now are passed over,
+      // not counted against `attempts`.
+      const order = opts.gateways.pick(64).filter((gw) => trusted(gw) || !sittingOut(gw)).slice(0, attempts);
+      for (const gw of order) {
+        if (!trusted(gw)) {
+          if (await serveVerified(gw, order)) return true;
+          continue;
+        }
         let upstream: Response;
         try {
           upstream = await fetchImpl(upstreamUrl(gw, site, path), {
@@ -623,6 +677,135 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
       }
       return false;
     };
+
+    // A stranger's gateway: take nothing from it on its word. Ask for the
+    // owner-signed evidence, check it (lib/c0mpute-verify.ts) and send only
+    // bytes whose hashes the signed manifest names. False when nothing was
+    // sent and the next gateway should be tried.
+    async function serveVerified(gw: string, others: string[]): Promise<boolean> {
+      const reqPath = path.split(/[?#]/)[0] || "/";
+      let answer: unknown;
+      try {
+        const r = await fetchImpl(`${gw}/hosting/v1/sites/${site}/resolve?path=${encodeURIComponent(reqPath)}`, {
+          redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (r.status >= 500) {
+          await r.body?.cancel();
+          opts.gateways.failed(gw);
+          log(`[edge] ${host} via ${gw} (verified): ${r.status}`);
+          return false;
+        }
+        if (r.status !== 200) {
+          // 404: a gateway older than the resolve route (c0mpute < 0.3.5), or
+          // one that does not know the site. Either way, no verified read.
+          await r.body?.cancel();
+          sitOut(gw, 300_000, `resolve answered ${r.status}`);
+          return false;
+        }
+        answer = await r.json();
+      } catch (e) {
+        if (e instanceof SyntaxError) { sitOut(gw, 300_000, "resolve answer is not JSON"); return false; }
+        opts.gateways.failed(gw);
+        log(`[edge] ${host} via ${gw} (verified): ${(e as Error).message}`);
+        return false;
+      }
+      let resolved: ReturnType<typeof verifyResolve>;
+      try {
+        resolved = verifyResolve(site!, reqPath, answer, seqs.min(site!));
+      } catch (e) {
+        const msg = e instanceof VerifyError ? e.message : String(e);
+        log(`[edge] ${host}${reqPath} via ${gw}: REJECTED: ${msg}`);
+        sitOut(gw, 600_000, `failed verification (${msg})`);
+        return false;
+      }
+      opts.gateways.succeeded(gw);
+      seqs.note(site!, resolved.record.seq);
+
+      const base: Record<string, string> = {
+        "x-c0mpute-gateway": new URL(gw).host,
+        "x-c0mpute-verified": "1",
+        "x-content-type-options": "nosniff",
+      };
+      const entry = resolved.entry;
+      if (!entry) {
+        res.writeHead(404, { ...base, "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=60" });
+        res.end(req.method === "HEAD" ? undefined : "not found");
+        return true;
+      }
+      const etag = entryEtag(entry);
+      const headers: Record<string, string> = {
+        ...base,
+        "content-type": /^[\x20-\x7e]{1,255}$/.test(entry.content_type) ? entry.content_type : "application/octet-stream",
+        "content-length": String(entry.size),
+        etag,
+        "cache-control": "public, max-age=60",
+      };
+      if (resolved.status === 200 && conditional && String(req.headers["if-none-match"]).split(/\s*,\s*/).includes(etag)) {
+        delete headers["content-length"];
+        res.writeHead(304, headers);
+        res.end();
+        return true;
+      }
+      if (req.method === "HEAD") {
+        res.writeHead(resolved.status, headers);
+        res.end();
+        return true;
+      }
+
+      // Chunks from anywhere: the hash makes the source irrelevant. The
+      // gateway that resolved first, then the others still in the running.
+      const sources = [gw, ...others, ...opts.gateways.pick(64)]
+        .filter((o, i, all) => all.indexOf(o) === i && !sittingOut(o));
+      const chunk = async (i: number): Promise<Buffer | null> => {
+        const hash = entry.chunks[i];
+        const want = chunkLength(entry.size, i);
+        const cached = await chunks.get(hash);
+        if (cached && cached.length === want) return cached;
+        for (const src of sources) {
+          if (sittingOut(src)) continue;
+          try {
+            const r = await fetchImpl(`${src}/hosting/v1/sites/${site}/chunks/${hash}`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+            if (r.status !== 200) { await r.body?.cancel(); continue; }
+            const bytes = Buffer.from(await r.arrayBuffer());
+            verifyChunk(bytes, hash, want);
+            chunks.put(hash, bytes);
+            return bytes;
+          } catch (e) {
+            if (e instanceof VerifyError) {
+              log(`[edge] ${host}${reqPath} chunk from ${src}: REJECTED: ${e.message}`);
+              sitOut(src, 600_000, `served a bad chunk (${e.message})`);
+            }
+          }
+        }
+        return null;
+      };
+
+      // The first chunk before the status line, so a file whose chunks cannot
+      // be had falls through to the next gateway (and then the stale copy).
+      const first = await chunk(0);
+      if (!first) {
+        log(`[edge] ${host}${reqPath}: no gateway had a good copy of chunk 0 of ${resolved.path}`);
+        return false;
+      }
+      res.writeHead(resolved.status, headers);
+      const keep = lastGood && resolved.status === 200 && entry.size <= lastGood.maxEntryBytes ? [first] : null;
+      if (!res.write(first)) await new Promise((r) => res.once("drain", r));
+      for (let i = 1; i < entry.chunks.length; i++) {
+        const next = await chunk(i);
+        if (!next) {
+          // Every byte sent so far was checked; the rest cannot be had. Cut
+          // the response short rather than send anything unverified.
+          log(`[edge] ${host}${reqPath}: chunk ${i} of ${resolved.path} unavailable mid-file`);
+          res.destroy();
+          return true;
+        }
+        keep?.push(next);
+        if (!res.write(next)) await new Promise((r) => res.once("drain", r));
+      }
+      res.end();
+      if (keep) lastGood!.put(key, 200, headers, Buffer.concat(keep));
+      return true;
+    }
 
     if (await tryRound()) return;
     for (const ms of delays) {
