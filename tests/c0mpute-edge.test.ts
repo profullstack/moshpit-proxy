@@ -437,6 +437,42 @@ test("plain http serves the same sites, GET and HEAD only, stale then 503 when n
   assert.match(miss.text, /back in a moment/);
 });
 
+test("a name pointed at a c0mpute app serves the app, every method, body and all", async (t) => {
+  const APP = "a4188f880e3f3b5383b5";
+  const sites = { site: async (name: string) => (name === "demo.killer" ? APP : name === "blue.eggs" ? SITE : null) };
+  const asked: Array<{ url: string; method: string; body: string; host: string | null }> = [];
+  const handler = createEdgeHandler({
+    sites,
+    gateways: { pick: () => ["http://g1:7777"], succeeded: () => {}, failed: () => {} },
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      if (url === `http://g1:7777/apps/v1/apps/${APP}`) return Response.json({ app: { app_id: APP, healthy: true } });
+      if (url.startsWith("http://g1:7777/apps/v1/apps/")) return Response.json({ error: "no such app" }, { status: 404 });
+      asked.push({ url, method: init?.method ?? "GET", body: init?.body ? Buffer.from(init.body as Uint8Array).toString() : "", host: headers.get("x-forwarded-host") });
+      if (url.startsWith(`http://g1:7777/a/${APP}/`)) return new Response("hits: 30", { status: 201, headers: { "content-type": "text/plain", "x-app": "yes" } });
+      return new Response("static", { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof fetch,
+  });
+  const srv = await listen((req, res) => { void handler(req, res); });
+  t.after(() => srv.server.close());
+  const port = Number(new URL(srv.url).port);
+  const call = (method: string, host: string, path: string, body?: string) => new Promise<{ status: number; text: string; app?: string }>((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, method, path, headers: { host, ...(body ? { "content-type": "text/plain" } : {}) } }, (res) => {
+      let text = ""; res.on("data", (d) => { text += d; }); res.on("end", () => resolve({ status: res.statusCode ?? 0, text, ...(res.headers["x-app"] ? { app: String(res.headers["x-app"]) } : {}) }));
+    });
+    req.on("error", reject); req.end(body);
+  });
+
+  assert.deepEqual(await call("POST", "demo.killer", "/cgi-bin/count?x=1", "+1"), { status: 201, text: "hits: 30", app: "yes" });
+  assert.deepEqual(asked.at(-1), { url: `http://g1:7777/a/${APP}/cgi-bin/count?x=1`, method: "POST", body: "+1", host: "demo.killer" });
+  assert.equal((await call("GET", "demo.killer", "/")).status, 201);
+  // A static site is still a static site: GET from /s/, no POST.
+  assert.deepEqual(await call("GET", "blue.eggs", "/"), { status: 200, text: "static" });
+  assert.equal(asked.at(-1)!.url, `http://g1:7777/s/${SITE}/`);
+  assert.equal((await call("POST", "blue.eggs", "/", "x")).status, 405);
+});
+
 test("a gateway that comes back mid-retry serves the request", async () => {
   let calls = 0;
   const handler = createEdgeHandler({

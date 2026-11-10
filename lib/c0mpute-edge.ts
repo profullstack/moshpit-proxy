@@ -411,6 +411,12 @@ export async function makeCsr(name: string): Promise<{ key: string; csr: string 
 /** Response headers worth passing back from a gateway. */
 const PASS_HEADERS = ["content-type", "content-length", "etag", "last-modified", "cache-control", "content-encoding"];
 
+/** Headers that belong to one connection, never passed on to or from an app. */
+const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate"]);
+
+/** The most of a request body taken for an app (it is held to retry another gateway). */
+const APP_BODY_MAX = 32 * 1024 * 1024;
+
 export interface EdgeHandlerOptions {
   sites: Pick<SiteLookup, "site">;
   /**
@@ -579,6 +585,28 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
     if (!sittingOut(gw)) log(`[edge] ${gw}: no verified reads for ${Math.round(ms / 1000)} s: ${why}`);
     unverifiable.set(gw, now() + ms);
   };
+  // Whether an id is a c0mpute app, as our own gateways answer /apps/v1/apps/<id>;
+  // kept 5 min for an app, 1 min for a site (an app deployed under a name shows up soon).
+  const appKinds = new Map<string, { app: boolean; until: number }>();
+  const isApp = async (id: string): Promise<boolean> => {
+    const known = appKinds.get(id);
+    if (known && known.until > now()) return known.app;
+    for (const gw of opts.gateways.pick(64).filter(trusted).slice(0, attempts)) {
+      try {
+        const r = await fetchImpl(`${gw}/apps/v1/apps/${id}`, { signal: AbortSignal.timeout(timeoutMs), headers: { accept: "application/json" } });
+        // Only the gateway's own answer about this very id counts: {"app": {"app_id": id, ...}}.
+        const answer = r.status === 200 ? await r.json().catch(() => null) as { app?: { app_id?: unknown } } | null : (await r.body?.cancel(), null);
+        if (r.status === 200 || r.status === 404) {
+          const app = answer?.app?.app_id === id;
+          appKinds.set(id, { app, until: now() + (app ? 300_000 : 60_000) });
+          return app;
+        }
+      } catch {
+        // the next gateway
+      }
+    }
+    return false;
+  };
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const send = (status: number, text: string) => {
@@ -595,17 +623,22 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
     const sni = (req.socket as TLSSocket).servername;
     if (typeof sni === "string" && sni && normalizeHost(sni) !== host) return send(421, "misdirected request");
 
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      res.setHeader("allow", "GET, HEAD");
-      return send(405, "static site: GET and HEAD only");
-    }
-
     const site = await opts.sites.site(host);
     // 421, not 404: "this server does not answer for that name", which a front
     // proxy can tell apart from a c0mpute site's own 404 (and park the name).
     if (!site) return send(421, `${host} does not point at a c0mpute site`);
 
     const path = (req.url || "/").startsWith("/") ? (req.url || "/") : "/";
+
+    // The id may be a c0mpute app (a backend, /a/<id>/) rather than a static
+    // site: the name then serves the app, every method, from our own gateways.
+    if (await isApp(site)) return serveApp(site);
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("allow", "GET, HEAD");
+      return send(405, "static site: GET and HEAD only");
+    }
+
     const key = LastGood.key(site, path);
     const conditional = Boolean(req.headers["if-none-match"]);
 
@@ -677,6 +710,77 @@ export function createEdgeHandler(opts: EdgeHandlerOptions) {
       }
       return false;
     };
+
+    // An app: its answers are live, not signed files, so only our own gateways
+    // carry it (nothing to verify from a stranger's). The request goes as it
+    // came, body and all, to /a/<app>/<path>; a gateway that cannot be reached
+    // or answers 502-504 is passed over while nothing has been sent.
+    async function serveApp(app: string): Promise<void> {
+      const method = req.method || "GET";
+      let body: Buffer | undefined;
+      if (method !== "GET" && method !== "HEAD") {
+        const parts: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req) {
+          size += (chunk as Buffer).length;
+          if (size > APP_BODY_MAX) return send(413, "request body too large");
+          parts.push(chunk as Buffer);
+        }
+        body = Buffer.concat(parts);
+      }
+      const headers: Record<string, string> = {};
+      for (const [name, value] of Object.entries(req.headers)) {
+        if (value === undefined || HOP_HEADERS.has(name) || name === "host") continue;
+        headers[name] = Array.isArray(value) ? value.join(", ") : value;
+      }
+      headers["x-forwarded-host"] = host!;
+      headers["x-forwarded-proto"] = (req.socket as TLSSocket).encrypted ? "https" : "http";
+      const order = opts.gateways.pick(64).filter(trusted).slice(0, attempts);
+      for (const gw of order) {
+        let upstream: Response;
+        try {
+          upstream = await fetchImpl(`${gw}/a/${app}${path}`, {
+            method, headers, ...(body ? { body: new Uint8Array(body) } : {}), redirect: "manual", signal: AbortSignal.timeout(Math.max(timeoutMs, 30_000)),
+          });
+        } catch (e) {
+          opts.gateways.failed(gw);
+          log(`[edge] ${host} (app) via ${gw}: ${(e as Error).message}`);
+          continue;
+        }
+        if (upstream.status >= 502 && upstream.status <= 504 && gw !== order[order.length - 1]) {
+          await upstream.body?.cancel();
+          log(`[edge] ${host} (app) via ${gw}: ${upstream.status}`);
+          continue;
+        }
+        opts.gateways.succeeded(gw);
+        const out: Record<string, string | string[]> = { "x-c0mpute-gateway": new URL(gw).host, "x-c0mpute-app": app };
+        upstream.headers.forEach((value, name) => {
+          if (!HOP_HEADERS.has(name) && name !== "set-cookie") out[name] = value;
+        });
+        const cookies = upstream.headers.getSetCookie?.() ?? [];
+        if (cookies.length) out["set-cookie"] = cookies;
+        res.writeHead(upstream.status, out);
+        if (method === "HEAD" || !upstream.body) {
+          await upstream.body?.cancel();
+          res.end();
+          return;
+        }
+        const reader = upstream.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!res.write(value)) await new Promise((r) => res.once("drain", r));
+          }
+          res.end();
+        } catch {
+          res.destroy();
+        }
+        return;
+      }
+      res.writeHead(503, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "retry-after": "30" });
+      res.end(method === "HEAD" ? undefined : FAIL_PAGE);
+    }
 
     // A stranger's gateway: take nothing from it on its word. Ask for the
     // owner-signed evidence, check it (lib/c0mpute-verify.ts) and send only
