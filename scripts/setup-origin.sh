@@ -197,6 +197,17 @@ LEAF_EXT='basicConstraints=critical,CA:FALSE'
 LEAF_USE='keyUsage=critical,digitalSignature,keyEncipherment'
 LEAF_EKU='extendedKeyUsage=serverAuth'
 
+# A renewal re-runs this script, and the self-signed certificate below is
+# written over $CRT before the registry is asked. Keep the one being replaced:
+# if the registry cannot sign this time (a timeout fetching its CA, a 5xx) and
+# the old certificate was a registry-signed chain that is still valid for this
+# key, it goes back instead of the name dropping to self-signed for good.
+PREV=""
+if [ "$DRY_RUN" = "0" ] && [ -f "$CRT" ]; then
+  PREV="$CRT.prev"
+  cp -p "$CRT" "$PREV"
+fi
+
 if [ -f "$KEY" ]; then
   # Reusing the key is the point: the pin is over the key, so a certificate can
   # be regenerated as often as you like and the published pin stays valid. It is
@@ -277,6 +288,19 @@ if [ "$SELF_SIGNED" = "0" ] && [ -n "$API_KEY" ]; then
       *)
         say "  ${DIM}the registry publishes no CA yet — keeping the self-signed certificate${OFF}" ;;
     esac
+  fi
+fi
+
+if [ -n "$PREV" ] && [ -f "$PREV" ]; then
+  if [ "$SIGNED" = "0" ] && ! openssl x509 -in "$PREV" -noout -issuer 2>/dev/null | grep -Eq "CN ?= ?$NAME\$" \
+     && openssl x509 -in "$PREV" -noout -checkend 0 >/dev/null 2>&1 \
+     && [ "$(openssl x509 -in "$PREV" -noout -pubkey 2>/dev/null | openssl sha256)" = "$(openssl pkey -in "$KEY" -pubout 2>/dev/null | openssl sha256)" ]; then
+    mv "$PREV" "$CRT"
+    chmod 644 "$CRT"
+    SIGNED=1
+    warn "the registry did not sign $NAME this time — kept its registry-signed certificate (until $(openssl x509 -in "$CRT" -noout -enddate | sed 's/notAfter=//'))"
+  else
+    rm -f "$PREV"
   fi
 fi
 
